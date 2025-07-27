@@ -211,6 +211,27 @@ def load_and_prepare_mmlu_pro() -> Dataset:
         return {"prompt": q, "response": f"<think>{chain}</think>\n\n{ex['answer']}"}
     return ds.map(_convert, remove_columns=ds.column_names)
 
+def load_and_prepare_r1_distill(subset: str = "v0") -> Dataset:
+    """
+    ServiceNow‑AI/R1‑Distill‑SFT
+
+    Maps the dataset to:
+        prompt   = `problem`
+        response = "<think>{chain‑of‑thought}</think>\\n\\n{solution}"
+    where `chain‑of‑thought` comes from `reannotated_assistant_content`
+    with any existing <think> tags stripped to avoid nesting.
+    """
+    ds = load_dataset("ServiceNow-AI/R1-Distill-SFT", subset, split="train")
+
+    def _convert(ex):
+        # Extract and clean chain‑of‑thought
+        chain = re.sub(r"</?think>", "", ex["reannotated_assistant_content"]).strip()
+        return {
+            "prompt": ex["problem"].strip(),
+            "response": f"<think>{chain}</think>\n\n{ex['solution'].strip()}",
+        }
+
+    return ds.map(_convert, remove_columns=ds.column_names)
 
 def concatenate_and_cap(dsets: List[Dataset], cap: int, seed: int) -> Dataset:
     ds = concatenate_datasets(dsets).shuffle(seed=seed)
@@ -221,7 +242,7 @@ def concatenate_and_cap(dsets: List[Dataset], cap: int, seed: int) -> Dataset:
 
 def build_sft_dataset(args: Args) -> Dataset:
     sources: List[Dataset] = []
-    for fn in (load_and_prepare_longtalk, load_and_prepare_gsm8k, load_and_prepare_mmlu_pro):
+    for fn in (load_and_prepare_longtalk, load_and_prepare_gsm8k, load_and_prepare_mmlu_pro, load_and_prepare_r1_distill,):
         try:
             d = fn()
             if len(d): sources.append(d)

@@ -39,7 +39,7 @@ def set_seed(seed: int) -> None:
 
 @dataclass
 class Args:
-    base_model_id: str = os.environ.get("BASE_MODEL_ID", "google/gemma-3-27b")
+    base_model_id: str = os.environ.get("BASE_MODEL_ID", "google/gemma-3-27b-int")
     reward_model_id: str = os.environ.get("REWARD_MODEL_ID", "UW-Madison-Lee-Lab/VersaPRM")
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     run_sft: bool = True

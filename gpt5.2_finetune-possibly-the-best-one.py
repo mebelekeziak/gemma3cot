@@ -595,7 +595,7 @@ def main(argv: List[str]):
         print("RUN_SFT=False – skipping SFT and loading existing merged model.")
 
     ds = build_sft_dataset(args)
-    n = min(128, len(ds))
+    n = min(128000, len(ds))
     rl_prompts = ds.shuffle(seed=args.seed).select(range(n))["prompt"]
 
     ppo_train(args, merged_path, rl_prompts)

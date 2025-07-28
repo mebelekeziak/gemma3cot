@@ -203,7 +203,7 @@ def load_and_prepare_gsm8k() -> Dataset:
 
 def load_and_prepare_mmlu_pro() -> Dataset:
     try:
-        ds = load_dataset("UW-Madison-Lee-Lab/MMLU-Pro-CoT-Train-Labeled", split="train[:1000]")
+        ds = load_dataset("UW-Madison-Lee-Lab/MMLU-Pro-CoT-Train-Labeled", split="train")
     except Exception:
         return Dataset.from_dict({"prompt":[], "response":[]})
     def _convert(ex):

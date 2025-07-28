@@ -29,6 +29,7 @@ from trl import (
     PPOTrainer,
     create_reference_model,
 )
+from huggingface_hub import HfApi
 
 # ------------------------------------------------------------------
 # CONFIGURATION
@@ -43,6 +44,10 @@ RUN_SFT = False
 # Where to save the merged SFT model
 MERGED_PATH = "./gemma3_cot_sft_merged"
 LORA_CHECKPOINT_PATH = "./gemma3_cot_sft_lora"
+
+HF_REPO        = os.environ.get("HF_REPO")
+HF_TOKEN       = os.environ.get("HF_TOKEN")
+MAX_SHARD_SIZE = "10GB"
 
 # ------------------------------------------------------------------
 # TOKENIZER & MODEL LOADING
@@ -175,7 +180,17 @@ if RUN_SFT:
     merged_model = model.merge_and_unload()
     os.makedirs(MERGED_PATH, exist_ok=True)
     tokenizer.save_pretrained(MERGED_PATH)
-    merged_model.save_pretrained(MERGED_PATH)
+    merged_model.save_pretrained(
+        MERGED_PATH,
+        max_shard_size=MAX_SHARD_SIZE,
+    )
+    if HF_REPO:
+        merged_model.push_to_hub(
+            HF_REPO,
+            token=HF_TOKEN,
+            max_shard_size=MAX_SHARD_SIZE,
+        )
+        tokenizer.push_to_hub(HF_REPO, token=HF_TOKEN)
 
     # Clean up to free VRAM
     del base_model, model
@@ -258,6 +273,18 @@ def rl_finetune(num_epochs: int = 1):
             rewards = [compute_step_scores(tokenizer.decode(out[0], skip_special_tokens=True))]
             ppo_trainer.step([query_ids["input_ids"][0]], [out[0]], rewards)
         print(f"Completed RL epoch {epoch+1}/{num_epochs}")
+
+    final_dir = os.path.join(MERGED_PATH, "ppo_final")
+    os.makedirs(final_dir, exist_ok=True)
+    ppo_model.save_pretrained(
+        final_dir,
+        max_shard_size=MAX_SHARD_SIZE,
+    )
+    tokenizer.save_pretrained(final_dir)
+    if HF_REPO:
+        api = HfApi(token=HF_TOKEN)
+        api.create_repo(HF_REPO, exist_ok=True)
+        api.upload_folder(folder_path=final_dir, repo_id=HF_REPO)
 
 # Uncomment to run RL:
 # rl_finetune(num_epochs=1)

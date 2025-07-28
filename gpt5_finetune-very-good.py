@@ -18,6 +18,7 @@ from trl import (
     PPOTrainer,
     create_reference_model,
 )
+from huggingface_hub import HfApi
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -67,6 +68,11 @@ class Args:
     longtalk_n: int = 0  # 0 -> all
     gsm8k_n: int = 0
     mmlu_pro_n: int = 1000
+
+    # Hugging Face Hub
+    hf_repo: Optional[str] = os.environ.get("HF_REPO")
+    hf_token: Optional[str] = os.environ.get("HF_TOKEN")
+    max_shard_size: str = "10GB"
 
 
 def load_and_prepare_longtalk() -> Dataset:
@@ -218,8 +224,20 @@ def sft_train(args: Args):
     trainer.save_model(args.lora_ckpt_dir)
 
     merged_model = model.merge_and_unload()
-    merged_model.save_pretrained(args.merged_path, safe_serialization=True)
+    merged_model.save_pretrained(
+        args.merged_path,
+        safe_serialization=True,
+        max_shard_size=args.max_shard_size,
+    )
     tokenizer.save_pretrained(args.merged_path)
+    if args.hf_repo:
+        merged_model.push_to_hub(
+            args.hf_repo,
+            token=args.hf_token,
+            safe_serialization=True,
+            max_shard_size=args.max_shard_size,
+        )
+        tokenizer.push_to_hub(args.hf_repo, token=args.hf_token)
     del model, merged_model
     torch.cuda.empty_cache()
     return args.merged_path
@@ -294,6 +312,19 @@ def ppo_train(args: Args, merged_path: str, sft_prompts: List[str]):
             response_tensors = [gen[j] for j in range(len(batch_prompts))]
             trainer.step(query_tensors, response_tensors, rewards)
         print(f"[PPO] finished epoch {epoch+1}/{args.ppo_epochs}")
+
+    final_dir = os.path.join(args.merged_path, "ppo_final")
+    os.makedirs(final_dir, exist_ok=True)
+    ppo_model.save_pretrained(
+        final_dir,
+        safe_serialization=True,
+        max_shard_size=args.max_shard_size,
+    )
+    tok.save_pretrained(final_dir)
+    if args.hf_repo:
+        api = HfApi(token=args.hf_token)
+        api.create_repo(args.hf_repo, exist_ok=True)
+        api.upload_folder(folder_path=final_dir, repo_id=args.hf_repo)
 
 
 def main():

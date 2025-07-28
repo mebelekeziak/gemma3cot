@@ -203,7 +203,7 @@ def load_and_prepare_gsm8k() -> Dataset:
 
 def load_and_prepare_mmlu_pro() -> Dataset:
     try:
-        ds = load_dataset("UW-Madison-Lee-Lab/MMLU-Pro-CoT-Train-Labeled", split="train[:1000]")
+        ds = load_dataset("UW-Madison-Lee-Lab/MMLU-Pro-CoT-Train-Labeled", split="train")
     except Exception:
         return Dataset.from_dict({"prompt":[], "response":[]})
     def _convert(ex):
@@ -595,7 +595,7 @@ def main(argv: List[str]):
         print("RUN_SFT=False – skipping SFT and loading existing merged model.")
 
     ds = build_sft_dataset(args)
-    n = min(128, len(ds))
+    n = min(128000, len(ds))
     rl_prompts = ds.shuffle(seed=args.seed).select(range(n))["prompt"]
 
     ppo_train(args, merged_path, rl_prompts)

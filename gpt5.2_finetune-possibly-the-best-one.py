@@ -18,6 +18,7 @@ from trl import (
     PPOTrainer,
     create_reference_model,
 )
+from huggingface_hub import HfApi
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -96,6 +97,11 @@ class Args:
     manifest_name: str = "manifest.json"
     jsonl_log: str = "metrics.jsonl"
 
+    # Hugging Face Hub
+    hf_repo: Optional[str] = os.environ.get("HF_REPO")
+    hf_token: Optional[str] = os.environ.get("HF_TOKEN")
+    max_shard_size: str = "10GB"
+
 
 def parse_args(argv: List[str]) -> Args:
     import argparse
@@ -157,6 +163,11 @@ def parse_args(argv: List[str]) -> Args:
     # Distributed hints
     p.add_argument("--fsdp", action="store_true", default=None)
     p.add_argument("--deepspeed-config", type=str, default=None)
+
+    # Hugging Face Hub
+    p.add_argument("--hf-repo", type=str, default=None, help="HF repo id for upload")
+    p.add_argument("--hf-token", type=str, default=None, help="HF auth token")
+    p.add_argument("--max-shard-size", type=str, default=None, help="Max shard size for saved models")
 
     args_ns = p.parse_args(argv)
     args = Args()  # defaults
@@ -390,8 +401,20 @@ def sft_train(args: Args) -> str:
     # Guarded merge
     try:
         merged_model = model.merge_and_unload()
-        merged_model.save_pretrained(args.merged_path, safe_serialization=True)
+        merged_model.save_pretrained(
+            args.merged_path,
+            safe_serialization=True,
+            max_shard_size=args.max_shard_size,
+        )
         tokenizer.save_pretrained(args.merged_path)
+        if args.hf_repo:
+            merged_model.push_to_hub(
+                args.hf_repo,
+                token=args.hf_token,
+                safe_serialization=True,
+                max_shard_size=args.max_shard_size,
+            )
+            tokenizer.push_to_hub(args.hf_repo, token=args.hf_token)
     except Exception as e:
         print(f"[ERROR] merge failed: {e}")
         raise
@@ -526,7 +549,18 @@ def ppo_train(args: Args, merged_path: str, sft_prompts: List[str]):
             })
         print(f"[PPO] finished epoch {epoch+1}/{args.ppo_epochs}")
 
-    trainer.save_pretrained(os.path.join(args.output_dir, "ppo_final"))
+    final_dir = os.path.join(args.output_dir, "ppo_final")
+    trainer.save_pretrained(final_dir)
+    ppo_model.save_pretrained(
+        final_dir,
+        safe_serialization=True,
+        max_shard_size=args.max_shard_size,
+    )
+    tok.save_pretrained(final_dir)
+    if args.hf_repo:
+        api = HfApi(token=args.hf_token)
+        api.create_repo(args.hf_repo, exist_ok=True)
+        api.upload_folder(folder_path=final_dir, repo_id=args.hf_repo)
 
 # ----------------------- Manifest -----------------------
 

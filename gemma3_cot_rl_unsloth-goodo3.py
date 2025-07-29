@@ -21,6 +21,7 @@ Dependencies:
 """
 
 import os, re, torch, warnings
+from huggingface_hub import HfApi
 from datasets import load_dataset, concatenate_datasets, Dataset
 
 # ----------------------------------------------------------------------
@@ -36,6 +37,10 @@ RUN_SFT = True
 # Where to save artefacts
 MERGED_PATH         = "./gemma3_cot_sft_merged"
 LORA_CHECKPOINT_DIR = "./gemma3_cot_sft_lora"
+
+HF_REPO        = os.environ.get("HF_REPO")
+HF_TOKEN       = os.environ.get("HF_TOKEN")
+MAX_SHARD_SIZE = "10GB"
 
 # LoRA hyper‑params
 LORA_R           = 16
@@ -189,8 +194,18 @@ if RUN_SFT:
 
     # Merge LoRA into base weights & save fp16/bf16 checkpoint
     merged_model = model.merge_and_unload()
-    merged_model.save_pretrained(MERGED_PATH)
+    merged_model.save_pretrained(
+        MERGED_PATH,
+        max_shard_size=MAX_SHARD_SIZE,
+    )
     tokenizer.save_pretrained(MERGED_PATH)
+    if HF_REPO:
+        merged_model.push_to_hub(
+            HF_REPO,
+            token=HF_TOKEN,
+            max_shard_size=MAX_SHARD_SIZE,
+        )
+        tokenizer.push_to_hub(HF_REPO, token=HF_TOKEN)
 
     del model, merged_model
     torch.cuda.empty_cache()
@@ -288,6 +303,18 @@ def rl_finetune(num_epochs: int = 1):
             reward = compute_step_scores(tokenizer.decode(gen[0], skip_special_tokens=True))
             ppo_trainer.step([query_ids["input_ids"][0]], [gen[0]], [reward])
         print(f"[PPO] finished epoch {ep+1}/{num_epochs}")
+
+    final_dir = os.path.join(MERGED_PATH, "ppo_final")
+    os.makedirs(final_dir, exist_ok=True)
+    ppo_model.save_pretrained(
+        final_dir,
+        max_shard_size=MAX_SHARD_SIZE,
+    )
+    tokenizer.save_pretrained(final_dir)
+    if HF_REPO:
+        api = HfApi(token=HF_TOKEN)
+        api.create_repo(HF_REPO, exist_ok=True)
+        api.upload_folder(folder_path=final_dir, repo_id=HF_REPO)
 
 # To launch PPO training:
 # rl_finetune(num_epochs=1)

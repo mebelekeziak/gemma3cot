@@ -181,7 +181,7 @@ def parse_args(argv: List[str]) -> Args:
 def load_and_prepare_longtalk() -> Dataset:
     ds = load_dataset("kenhktsui/longtalk-cot-v0.1", split="train")
     def _convert(ex):
-        messages = ex["messages"]
+        messages = ex["chosen"]
         user_msg      = next((m["content"] for m in messages if m["role"]=="user"), "").strip()
         assistant_msg = next((m["content"] for m in messages if m["role"]=="assistant"), "").strip()
         m = re.search(r"(?:Answer:|####)(.*)", assistant_msg)

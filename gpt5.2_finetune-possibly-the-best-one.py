@@ -381,7 +381,7 @@ def sft_train(args: Args) -> str:
         warmup_ratio=args.warmup_ratio,
         lr_scheduler_type="cosine",
         bf16=False,  # !!! CHANGE TO True IF SUPPORTED !!!
-        fp16=True,  # !!! CHANGE TO True IF BF16 NOT SUPPORTED !!!
+        fp16=False,  # !!! CHANGE TO True IF BF16 NOT SUPPORTED !!!
         logging_steps=10,
         save_steps=500,
         save_total_limit=2,

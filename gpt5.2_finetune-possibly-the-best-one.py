@@ -386,6 +386,7 @@ def sft_train(args: Args) -> str:
         save_steps=500,
         save_total_limit=2,
         report_to="none",
+        remove_unused_columns=False,   # ← disable automatic column pruning
     )
 
     trainer = Trainer(

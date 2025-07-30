@@ -344,7 +344,7 @@ def sft_train(args: Args) -> str:
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.base_model_id,
         max_seq_length=args.max_seq_len,
-        dtype=torch.bfloat16,
+        dtype=torch.float16, # !!! CHANGE TO BF16 IF SUPPORTED !!!
         load_in_4bit=args.load_in_4bit,
     )
     tokenizer.add_special_tokens({"additional_special_tokens": ["<think>", "</think>"]})
@@ -380,7 +380,8 @@ def sft_train(args: Args) -> str:
         weight_decay=args.weight_decay,
         warmup_ratio=args.warmup_ratio,
         lr_scheduler_type="cosine",
-        bf16=True,
+        bf16=False,  # !!! CHANGE TO True IF SUPPORTED !!!
+        fp16=True,  # !!! CHANGE TO True IF BF16 NOT SUPPORTED !!!
         logging_steps=10,
         save_steps=500,
         save_total_limit=2,

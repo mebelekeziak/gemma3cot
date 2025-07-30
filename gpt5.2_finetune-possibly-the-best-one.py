@@ -467,7 +467,7 @@ def compute_step_scores(text: str, tok: AutoTokenizer, mdl: AutoModelForCausalLM
 def ppo_train(args: Args, merged_path: str, sft_prompts: List[str]):
     tok = prepare_tokenizer(merged_path)
     ppo_model = AutoModelForCausalLMWithValueHead.from_pretrained(
-        merged_path, load_in4bit=True, #change if no
+        merged_path, load_in_4bit=True, #change if no
           torch_dtype=torch.bfloat16, device_map="auto"
     )
     ppo_model.resize_token_embeddings(len(tok))

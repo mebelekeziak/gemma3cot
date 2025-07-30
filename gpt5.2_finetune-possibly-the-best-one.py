@@ -344,7 +344,7 @@ def sft_train(args: Args) -> str:
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.base_model_id,
         max_seq_length=args.max_seq_len,
-        dtype=torch.float32, # !!! CHANGE TO BF16 IF SUPPORTED !!!
+       # dtype=torch.bfloat16, # !!! CHANGE TO BF16 IF SUPPORTED !!!
         load_in_4bit=args.load_in_4bit,
     )
     tokenizer.add_special_tokens({"additional_special_tokens": ["<think>", "</think>"]})

@@ -100,7 +100,7 @@ class Args:
     # Hugging Face Hub
     hf_repo: Optional[str] = os.environ.get("HF_REPO")
     hf_token: Optional[str] = os.environ.get("HF_TOKEN")
-    max_shard_size: str = "10GB"
+    max_shard_size: str = "2GB"
 
 
 def parse_args(argv: List[str]) -> Args:

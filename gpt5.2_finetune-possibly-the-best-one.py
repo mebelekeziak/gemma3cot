@@ -436,11 +436,12 @@ def sft_train(args: Args) -> str:
 
 def build_reward(args: Args):
     tok = AutoTokenizer.from_pretrained(args.reward_model_id, use_fast=True)
+    os.makedirs(args.offload_dir, exist_ok=True)
     mdl = AutoModelForCausalLM.from_pretrained(
         args.reward_model_id,
         torch_dtype=torch.bfloat16,
         device_map="auto",
-        offload_folder=args.offload_dir,
+        offload_dir=args.offload_dir,
     )
     inc = tok.convert_tokens_to_ids("<INCORRECT>")
     cor = tok.convert_tokens_to_ids("<CORRECT>")

@@ -102,8 +102,6 @@ class Args:
     hf_token: Optional[str] = os.environ.get("HF_TOKEN")
     max_shard_size: str = "2GB"
 
-    # Offloading
-    offload_dir: str = "./offload"
 
 
 def parse_args(argv: List[str]) -> Args:
@@ -120,7 +118,6 @@ def parse_args(argv: List[str]) -> Args:
     p.add_argument("--merged-path", type=str, default=None)
     p.add_argument("--lora-ckpt-dir", type=str, default=None)
     p.add_argument("--output-dir", type=str, default=None)
-    p.add_argument("--offload-dir", type=str, default=None)
 
     # LoRA
     p.add_argument("--lora-r", type=int, default=None)
@@ -436,12 +433,10 @@ def sft_train(args: Args) -> str:
 
 def build_reward(args: Args):
     tok = AutoTokenizer.from_pretrained(args.reward_model_id, use_fast=True)
-    os.makedirs(args.offload_dir, exist_ok=True)
     mdl = AutoModelForCausalLM.from_pretrained(
         args.reward_model_id,
         torch_dtype=torch.bfloat16,
         device_map="auto",
-        offload_folder=args.offload_dir,
         low_cpu_mem_usage=True,
     )
     inc = tok.convert_tokens_to_ids("<INCORRECT>")
@@ -477,7 +472,6 @@ def ppo_train(args: Args, merged_path: str, sft_prompts: List[str]):
         merged_path,
         torch_dtype=torch.bfloat16,
         device_map="auto",
-        offload_folder=args.offload_dir,
     )
     ref_model = create_reference_model(ppo_model)
 
@@ -629,7 +623,6 @@ def main(argv: List[str]):
     args = parse_args(argv)
     set_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
-    os.makedirs(args.offload_dir, exist_ok=True)
 
     write_manifest(args, stage="start", extra={})
 

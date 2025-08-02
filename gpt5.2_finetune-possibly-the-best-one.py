@@ -441,7 +441,7 @@ def build_reward(args: Args):
         args.reward_model_id,
         torch_dtype=torch.bfloat16,
         device_map="auto",
-        offload_dir=args.offload_dir,
+        offload_folder=args.offload_dir,
     )
     inc = tok.convert_tokens_to_ids("<INCORRECT>")
     cor = tok.convert_tokens_to_ids("<CORRECT>")

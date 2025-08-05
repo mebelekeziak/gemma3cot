@@ -89,7 +89,7 @@ def chunk_examples(examples, *, tokenizer, block_size: int):
 
 
 def main(args):
-    tokenizer = AutoTokenizer.from_pretrained("google/gemma-3n-e4b", use_fast=True, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained("huihui-ai/Huihui-gemma-3n-E4B-it-abliterated", use_fast=True, trust_remote_code=True)
     ds = build_dataset(args.corpus_dir).shuffle(seed=42)
     block = args.sequence_length - 1  # reserve 1 token for <bos>
     ds = ds.map(chunk_examples, batched=True, remove_columns=["text"], fn_kwargs={"tokenizer": tokenizer, "block_size": block})
@@ -97,7 +97,7 @@ def main(args):
     data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
 
     model = AutoModelForCausalLM.from_pretrained(
-        "google/gemma-3n-e4b", torch_dtype=torch.bfloat16, revision=None, trust_remote_code=True
+        "huihui-ai/Huihui-gemma-3n-E4B-it-abliterated", torch_dtype=torch.bfloat16, revision=None, trust_remote_code=True
     )
     model.gradient_checkpointing_enable()
 

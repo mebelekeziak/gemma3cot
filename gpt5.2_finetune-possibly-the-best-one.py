@@ -1,5 +1,7 @@
 #!/usr/bin/env python
-import os, re, math, json, time, signal, warnings, random, subprocess, sys
+# -*- coding: utf-8 -*-
+
+import os, re, json, time, signal, warnings, random, subprocess, sys
 from dataclasses import dataclass, asdict
 from typing import List, Tuple, Dict, Any, Optional
 
@@ -8,6 +10,7 @@ import torch
 from datasets import load_dataset, concatenate_datasets, Dataset
 from transformers import (
     AutoTokenizer,
+    AutoModelForCausalLM,
     AutoModelForCausalLM,
     TrainingArguments,
     Trainer,
@@ -19,10 +22,11 @@ from trl import (
     create_reference_model,
 )
 from huggingface_hub import HfApi
+from peft import PeftModel
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# ----------------------- Utilities -----------------------
+# ======================= Utilities =======================
 
 def get_git_commit() -> Optional[str]:
     try:
@@ -40,17 +44,23 @@ def set_seed(seed: int) -> None:
 
 @dataclass
 class Args:
+    # Base + reward
     base_model_id: str = os.environ.get("BASE_MODEL_ID", "google/gemma-3-27b-int")
     reward_model_id: str = os.environ.get("REWARD_MODEL_ID", "UW-Madison-Lee-Lab/VersaPRM-Base-3B")
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    run_sft: bool = True
 
-    # paths
+    # Flow toggles
+    run_sft: bool = True
+    run_merge_after_ppo: bool = True
+    rl_on_lora: bool = True  # keep for clarity; PPO trains LoRA + v-head only
+
+    # Paths
     merged_path: str = "./gemma3_cot_sft_merged"
     lora_ckpt_dir: str = "./gemma3_cot_sft_lora"
+    ppo_lora_dir: str = "./gemma3_cot_ppo_lora"
     output_dir: str = "./runs/gemma3_cot"
 
-    # LoRA
+    # LoRA (SFT)
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
@@ -64,15 +74,17 @@ class Args:
     warmup_ratio: float = 0.03
     load_in_4bit: bool = True
     seed: int = 42
-    pack_sequences: bool = False  # Optional greedy packing to reduce padding
+    pack_sequences: bool = False
 
-    # PPO
+    # PPO core
     ppo_batch_size: int = 4
     ppo_mini_bs: int = 1
     ppo_epochs: int = 4
     ppo_lr: float = 5e-6
     ppo_target_kl: float = 6.0
     ppo_max_new_tokens: int = 512
+
+    # Sampling
     gen_temperature: float = 0.7
     gen_top_p: float = 0.9
     gen_top_k: int = 0
@@ -80,8 +92,8 @@ class Args:
     min_new_tokens: int = 16
     length_penalty: float = 1.0
 
-    # Reward shaping
-    reward_samples: int = 1          # average N generations per prompt for reward (costly)
+    # Reward sampling/averaging
+    reward_samples: int = 1
     reward_temperature: float = 0.7
 
     # Data sampling caps (0 -> all)
@@ -89,34 +101,46 @@ class Args:
     gsm8k_n: int = 0
     mmlu_pro_n: int = 1000
 
-    # Distributed hints (for accelerate/FSDP/DeepSpeed)
+    # Extra RL features
+    ref_free: bool = False              # reference-free PPO (no frozen ref model)
+    entropy_beta: float = 0.0           # entropy bonus coeff (0 = off)
+    kl_anneal: str = "none"             # "none" | "linear" | "cosine"
+    kl_min: float = 1.0                 # min target KL for anneal
+    kl_max: float = 6.0                 # max target KL for anneal (start)
+    eval_every: int = 100               # PPO steps between evals (0 = disable)
+    eval_gsm8k_n: int = 128             # eval subset size from GSM8K
+    reward_w_prm: float = 1.0           # weight of VersaPRM signal
+    reward_w_rule: float = 0.2          # weight of rule/safety critic
+    reward_clip_min: float = -1.0       # optional clipping
+    reward_clip_max: float = 1.0
+
+    # Distributed / Hub
     fsdp: bool = False
     deepspeed_config: Optional[str] = None
-
-    # Manifest & logging
     manifest_name: str = "manifest.json"
     jsonl_log: str = "metrics.jsonl"
-
-    # Hugging Face Hub
     hf_repo: Optional[str] = os.environ.get("HF_REPO")
     hf_token: Optional[str] = os.environ.get("HF_TOKEN")
     max_shard_size: str = "2GB"
 
 
-
 def parse_args(argv: List[str]) -> Args:
     import argparse
-    p = argparse.ArgumentParser(description="Gemma-3 CoT SFT + PPO trainer")
+    p = argparse.ArgumentParser(description="Gemma-3 CoT SFT + PPO on LoRA with KL anneal, entropy, eval, mixed rewards")
 
-    # High-level toggles
-    p.add_argument("--run-sft", action="store_true", default=None, help="Run SFT stage before PPO (default: True)")
+    # Toggles
+    p.add_argument("--run-sft", action="store_true", default=None)
     p.add_argument("--no-run-sft", dest="run_sft", action="store_false")
+    p.add_argument("--run-merge-after-ppo", action="store_true", default=None)
+    p.add_argument("--no-run-merge-after-ppo", dest="run_merge_after_ppo", action="store_false")
+    p.add_argument("--ref-free", action="store_true", default=None)
 
     # Model IDs / paths
     p.add_argument("--base-model-id", type=str, default=None)
     p.add_argument("--reward-model-id", type=str, default=None)
     p.add_argument("--merged-path", type=str, default=None)
     p.add_argument("--lora-ckpt-dir", type=str, default=None)
+    p.add_argument("--ppo-lora-dir", type=str, default=None)
     p.add_argument("--output-dir", type=str, default=None)
 
     # LoRA
@@ -144,7 +168,7 @@ def parse_args(argv: List[str]) -> Args:
     p.add_argument("--ppo-target-kl", type=float, default=None)
     p.add_argument("--ppo-max-new-tokens", type=int, default=None)
 
-    # Generation params
+    # Generation
     p.add_argument("--gen-temperature", type=float, default=None)
     p.add_argument("--gen-top-p", type=float, default=None)
     p.add_argument("--gen-top-k", type=int, default=None)
@@ -152,7 +176,7 @@ def parse_args(argv: List[str]) -> Args:
     p.add_argument("--min-new-tokens", type=int, default=None)
     p.add_argument("--length-penalty", type=float, default=None)
 
-    # Reward shaping
+    # Reward sampling
     p.add_argument("--reward-samples", type=int, default=None)
     p.add_argument("--reward-temperature", type=float, default=None)
 
@@ -161,30 +185,51 @@ def parse_args(argv: List[str]) -> Args:
     p.add_argument("--gsm8k-n", type=int, default=None)
     p.add_argument("--mmlu-pro-n", type=int, default=None)
 
-    # Distributed hints
+    # Extras
+    p.add_argument("--entropy-beta", type=float, default=None)
+    p.add_argument("--kl-anneal", type=str, choices=["none","linear","cosine"], default=None)
+    p.add_argument("--kl-min", type=float, default=None)
+    p.add_argument("--kl-max", type=float, default=None)
+    p.add_argument("--eval-every", type=int, default=None)
+    p.add_argument("--eval-gsm8k-n", type=int, default=None)
+    p.add_argument("--reward-w-prm", type=float, default=None)
+    p.add_argument("--reward-w-rule", type=float, default=None)
+    p.add_argument("--reward-clip-min", type=float, default=None)
+    p.add_argument("--reward-clip-max", type=float, default=None)
+
+    # Dist / Hub
     p.add_argument("--fsdp", action="store_true", default=None)
     p.add_argument("--deepspeed-config", type=str, default=None)
+    p.add_argument("--hf-repo", type=str, default=None)
+    p.add_argument("--hf-token", type=str, default=None)
+    p.add_argument("--max-shard-size", type=str, default=None)
 
-    # Hugging Face Hub
-    p.add_argument("--hf-repo", type=str, default=None, help="HF repo id for upload")
-    p.add_argument("--hf-token", type=str, default=None, help="HF auth token")
-    p.add_argument("--max-shard-size", type=str, default=None, help="Max shard size for saved models")
-
-    args_ns = p.parse_args(argv)
-    args = Args()  # defaults
-    for k, v in vars(args_ns).items():
+    ns = p.parse_args(argv)
+    args = Args()
+    for k, v in vars(ns).items():
         if v is not None:
             setattr(args, k, v)
+    # keep ppo_target_kl consistent with kl_max default
+    if args.kl_anneal != "none":
+        args.ppo_target_kl = args.kl_max
     return args
 
-# ----------------------- Data -----------------------
+# ======================= Data =======================
+
+_SINGLE_ANGLE_OPEN = "‹"
+_SINGLE_ANGLE_CLOSE = "›"
+
+def _normalize_angle_tags(text: str) -> str:
+    if not text:
+        return text
+    return text.replace(_SINGLE_ANGLE_OPEN, "<").replace(_SINGLE_ANGLE_CLOSE, ">")
 
 def load_and_prepare_longtalk() -> Dataset:
     ds = load_dataset("kenhktsui/longtalk-cot-v0.1", split="train")
     def _convert(ex):
-        messages = ex["chosen"]
-        user_msg      = next((m["content"] for m in messages if m["role"]=="user"), "").strip()
-        assistant_msg = next((m["content"] for m in messages if m["role"]=="assistant"), "").strip()
+        messages = ex.get("chosen") or []
+        user_msg      = next((m.get("content","") for m in messages if m.get("role")=="user"), "").strip()
+        assistant_msg = next((m.get("content","") for m in messages if m.get("role")=="assistant"), "").strip()
         m = re.search(r"(?:Answer:|####)(.*)", assistant_msg)
         if m:
             chain = assistant_msg[:m.start()].strip()
@@ -196,53 +241,43 @@ def load_and_prepare_longtalk() -> Dataset:
         return {"prompt": user_msg, "response": f"<think>{chain}</think>\n\n{final}"}
     return ds.map(_convert, remove_columns=ds.column_names)
 
-
 def load_and_prepare_gsm8k() -> Dataset:
     ds = load_dataset("thesven/gsm8k-reasoning", split="train")
     def _convert(ex):
-        q = ex["question"].strip()
-        gen = ex.get("generation", "") or ""
+        gen = _normalize_angle_tags(ex.get("generation","") or "")
+        q = ex.get("question", "").strip()
+        if not q:
+            msgs = ex.get("messages") or []
+            q = next((m.get("content","") for m in msgs if m.get("role")=="user"), "").strip()
         cot_parts = []
         for tag in ["thinking","reasoning","reflection","adjustment"]:
             m = re.search(fr"<{tag}>(.*?)</{tag}>", gen, re.DOTALL)
-            if m: cot_parts.append(m.group(1).strip())
-        chain = "\n\n".join(cot_parts)
+            if m:
+                cot_parts.append(m.group(1).strip())
+        chain = "\n\n".join([p for p in cot_parts if p])
         out_m = re.search(r"<output>(.*?)</output>", gen, re.DOTALL)
-        final = out_m.group(1).strip() if out_m else ex["answer"].strip()
+        final = (out_m.group(1).strip() if out_m else (ex.get("answer","") or "").strip())
         return {"prompt": q, "response": f"<think>{chain}</think>\n\n{final}"}
     return ds.map(_convert, remove_columns=ds.column_names)
 
-
 def load_and_prepare_mmlu_pro() -> Dataset:
-    try:
-        ds = load_dataset("UW-Madison-Lee-Lab/MMLU-Pro-CoT-Train-Labeled", split="train")
-    except Exception:
-        return Dataset.from_dict({"prompt":[], "response":[]})
+    ds = load_dataset("UW-Madison-Lee-Lab/MMLU-Pro-CoT-Train-Labeled", split="train")
     def _convert(ex):
-        q, chain = ex["question"].strip(), "\n".join(s.strip() for s in ex.get("cot",[]))
-        return {"prompt": q, "response": f"<think>{chain}</think>\n\n{ex['answer']}"}
+        q = ex.get("question","").strip()
+        cot_list = ex.get("chain_of_thoughts") or []
+        chain = "\n".join([str(s).strip() for s in cot_list if str(s).strip()])
+        ans = ex.get("answer","").strip()
+        return {"prompt": q, "response": f"<think>{chain}</think>\n\n{ans}"}
     return ds.map(_convert, remove_columns=ds.column_names)
 
 def load_and_prepare_r1_distill(subset: str = "v0") -> Dataset:
-    """
-    ServiceNow‑AI/R1‑Distill‑SFT
-
-    Maps the dataset to:
-        prompt   = `problem`
-        response = "<think>{chain‑of‑thought}</think>\\n\\n{solution}"
-    where `chain‑of‑thought` comes from `reannotated_assistant_content`
-    with any existing <think> tags stripped to avoid nesting.
-    """
     ds = load_dataset("ServiceNow-AI/R1-Distill-SFT", subset, split="train")
-
     def _convert(ex):
-        # Extract and clean chain‑of‑thought
-        chain = re.sub(r"</?think>", "", ex["reannotated_assistant_content"]).strip()
+        chain = re.sub(r"</?think>", "", ex.get("reannotated_assistant_content","")).strip()
         return {
-            "prompt": ex["problem"].strip(),
-            "response": f"<think>{chain}</think>\n\n{ex['solution'].strip()}",
+            "prompt": (ex.get("problem","") or "").strip(),
+            "response": f"<think>{chain}</think>\n\n{(ex.get('solution','') or '').strip()}",
         }
-
     return ds.map(_convert, remove_columns=ds.column_names)
 
 def concatenate_and_cap(dsets: List[Dataset], cap: int, seed: int) -> Dataset:
@@ -251,13 +286,13 @@ def concatenate_and_cap(dsets: List[Dataset], cap: int, seed: int) -> Dataset:
         ds = ds.select(range(cap))
     return ds
 
-
 def build_sft_dataset(args: Args) -> Dataset:
     sources: List[Dataset] = []
-    for fn in (load_and_prepare_longtalk, load_and_prepare_gsm8k, load_and_prepare_mmlu_pro, load_and_prepare_r1_distill,):
+    for fn in (load_and_prepare_longtalk, load_and_prepare_gsm8k, load_and_prepare_mmlu_pro, load_and_prepare_r1_distill):
         try:
             d = fn()
-            if len(d): sources.append(d)
+            if len(d):
+                sources.append(d)
         except Exception as e:
             print(f"[WARN] loading dataset failed: {e}")
     if not sources:
@@ -270,14 +305,12 @@ def build_sft_dataset(args: Args) -> Dataset:
     print(f"[DATA] total samples: {len(ds)}")
     return ds
 
-# ----------------------- Tokenizer -----------------------
+# ======================= Tokenizer =======================
 
-def prepare_tokenizer(path_or_id: str) -> AutoTokenizer:
+def prepare_tokenizer(path_or_id: str, left_pad: bool = False) -> AutoTokenizer:
     tok = AutoTokenizer.from_pretrained(path_or_id, use_fast=True)
     tok.add_special_tokens({"additional_special_tokens": ["<think>", "</think>"]})
-    # BOS/EOS/PAD checks
     if tok.eos_token is None:
-        # fallbacks: prefer sep or pad
         if tok.sep_token is not None:
             tok.eos_token = tok.sep_token
         elif tok.pad_token is not None:
@@ -286,9 +319,12 @@ def prepare_tokenizer(path_or_id: str) -> AutoTokenizer:
             tok.add_special_tokens({"eos_token": "</s>"})
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+    if left_pad:
+        tok.padding_side = 'left'
+        tok.truncation_side = 'left'
     return tok
 
-# ----------------------- Collators & packing -----------------------
+# ======================= Collator & packing =======================
 
 def make_sft_collator(tokenizer: AutoTokenizer, max_len: int):
     def collate(batch):
@@ -307,35 +343,25 @@ def make_sft_collator(tokenizer: AutoTokenizer, max_len: int):
         return {"input_ids": input_ids, "attention_mask": attn, "labels": labels}
     return collate
 
-
 def greedy_pack_examples(texts: List[str], tokenizer: AutoTokenizer, max_len: int) -> List[str]:
-    """Pack multiple short samples into longer sequences up to max_len tokens.
-    Simple greedy strategy; for production, prefer specialized packers.
-    """
-    packed: List[str] = []
-    cur: List[str] = []
-    cur_len = 0
+    packed, cur, cur_len = [], [], 0
     for t in texts:
         l = len(tokenizer.encode(t, add_special_tokens=False))
         if l > max_len:
-            # truncate overly long example as a standalone
             trunc = tokenizer.decode(tokenizer.encode(t, add_special_tokens=False)[:max_len])
             if cur:
-                packed.append("\n\n".join(cur))
-                cur, cur_len = [], 0
+                packed.append("\n\n".join(cur)); cur, cur_len = [], 0
             packed.append(trunc)
             continue
         if cur_len + l <= max_len:
-            cur.append(t)
-            cur_len += l
+            cur.append(t); cur_len += l
         else:
-            packed.append("\n\n".join(cur))
-            cur, cur_len = [t], l
+            packed.append("\n\n".join(cur)); cur, cur_len = [t], l
     if cur:
         packed.append("\n\n".join(cur))
     return packed
 
-# ----------------------- SFT -----------------------
+# ======================= SFT =======================
 
 def sft_train(args: Args) -> str:
     from unsloth import FastLanguageModel
@@ -345,7 +371,7 @@ def sft_train(args: Args) -> str:
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.base_model_id,
         max_seq_length=args.max_seq_len,
-        dtype=torch.bfloat16, # !!! CHANGE TO BF16 IF SUPPORTED AND UNCOMMENT !!!
+        dtype=torch.bfloat16,
         load_in_4bit=args.load_in_4bit,
     )
     tokenizer.add_special_tokens({"additional_special_tokens": ["<think>", "</think>"]})
@@ -370,7 +396,6 @@ def sft_train(args: Args) -> str:
         packed_texts = greedy_pack_examples(texts, tokenizer, args.max_seq_len)
         ds = Dataset.from_dict({"prompt": ["" for _ in packed_texts], "response": packed_texts})
         print(f"[PACK] packed sequences: {len(packed_texts)}")
-        # Collator will still work since prompt is empty (all labels are response)
 
     train_args = TrainingArguments(
         output_dir=os.path.join(args.output_dir, "sft"),
@@ -381,13 +406,13 @@ def sft_train(args: Args) -> str:
         weight_decay=args.weight_decay,
         warmup_ratio=args.warmup_ratio,
         lr_scheduler_type="cosine",
-        bf16=False,  # !!! CHANGE TO True IF SUPPORTED !!!
-        fp16=False,  # !!! CHANGE TO True IF BF16 NOT SUPPORTED !!!
+        bf16=False,
+        fp16=False,
         logging_steps=10,
         save_steps=500,
         save_total_limit=2,
         report_to="none",
-        remove_unused_columns=False,   # ← disable automatic column pruning
+        remove_unused_columns=False,
     )
 
     trainer = Trainer(
@@ -399,97 +424,208 @@ def sft_train(args: Args) -> str:
     )
 
     trainer.train()
-    trainer.save_model(args.lora_ckpt_dir)
+    model.save_pretrained(args.lora_ckpt_dir)  # adapters only
+    tokenizer.save_pretrained(args.lora_ckpt_dir)
+    torch.cuda.empty_cache()
+    return args.lora_ckpt_dir
 
-    # Guarded merge
-    try:
-        merged_model = model.merge_and_unload()
-        merged_model.save_pretrained(
-            args.merged_path,
-            safe_serialization=True,
-            max_shard_size=args.max_shard_size,
+# ======================= Reward (VersaPRM) =======================
+
+class VersaPRM:
+    """
+    VersaPRM recipe:
+      - candidate token ids [INCORRECT, CORRECT] = [12, 10]
+      - step positions are the token id of " \\n\\n\\n\\n" (computed from tokenizer)
+      - input = question + " \\n\\n" + " \\n\\n\\n\\n".join(steps) + " \\n\\n\\n\\n"
+    """
+    def __init__(self, model_id: str, device: str):
+        self.tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+        self.tok.pad_token = self.tok.eos_token
+        self.tok.padding_side = "left"
+        self.tok.truncation_side = "left"
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=torch.bfloat16, device_map="auto", low_cpu_mem_usage=True
         )
-        tokenizer.save_pretrained(args.merged_path)
-        if args.hf_repo:
-            merged_model.push_to_hub(
-                args.hf_repo,
-                token=args.hf_token,
-                safe_serialization=True,
-                max_shard_size=args.max_shard_size,
-            )
-            tokenizer.push_to_hub(args.hf_repo, token=args.hf_token)
-    except Exception as e:
-        print(f"[ERROR] merge failed: {e}")
-        raise
-    finally:
-        del model
-        if "merged_model" in locals():
-            del merged_model
-        torch.cuda.empty_cache()
+        self.candidate_ids = [12, 10]
+        step_seq = self.tok.encode(" \n\n\n\n", add_special_tokens=False)
+        self.step_id = step_seq[-1] if len(step_seq) > 0 else self.tok.eos_token_id
+        self.device = device
 
-    return args.merged_path
+    def score(self, question: str, steps_text: str) -> float:
+        raw_lines = [ln.strip() for ln in (steps_text or "").split("\n") if ln.strip()]
+        if not raw_lines:
+            return 0.0
+        joined = " \n\n\n\n".join(raw_lines) + " \n\n\n\n"
+        input_text = (question or "").strip() + " \n\n" + joined
+        input_ids = torch.tensor([self.tok.encode(input_text)], device=self.device)
+        with torch.no_grad():
+            logits = self.model(input_ids).logits[:, :, self.candidate_ids]
+            probs_correct = torch.softmax(logits, dim=-1)[:, :, 1]
+        mask = (input_ids == self.step_id).float()
+        if mask.sum().item() < 1:
+            return probs_correct.mean().item()
+        return (probs_correct * mask).sum().item() / mask.sum().item()
 
-# ----------------------- Reward -----------------------
+def extract_think(text: str) -> str:
+    text = _normalize_angle_tags(text or "")
+    m = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
+    return m.group(1).strip() if m else text
 
-def build_reward(args: Args):
-    tok = AutoTokenizer.from_pretrained(args.reward_model_id, use_fast=True)
-    mdl = AutoModelForCausalLM.from_pretrained(
-        args.reward_model_id,
+# ======================= Rule/Safety Critic =======================
+
+BAD_PHRASES = [
+    "I can't help with that", "I'm unable to", "I cannot assist", "as an AI",
+    "I'm just an AI", "sorry, I can't", "I'm sorry, I can't", "cannot comply"
+]
+
+def rule_safety_reward(prompt: str, output: str) -> float:
+    """
+    Very light heuristic reward, scaled to ~[-1, 1]:
+    + format sanity (has final answer token, not absurdly long, no repetition spam)
+    - penalize refusal phrases, empty answers, or hallucinated tool calls
+    """
+    if not output or not output.strip():
+        return -0.5
+
+    # Try to find final answer after </think>
+    tail = output.split("</think>")[-1] if "</think>" in output else output
+    tail = tail.strip()
+
+    # penalize obvious refusals
+    if any(p.lower() in output.lower() for p in BAD_PHRASES):
+        return -0.5
+
+    # length sanity
+    tok_est = len(re.findall(r"\S+", tail))
+    len_score = 0.0
+    if 1 <= tok_est <= 200:
+        len_score = 0.2
+    elif tok_est > 500:
+        len_score = -0.2
+
+    # repetition penalty (very crude)
+    reps = sum(1 for m in re.finditer(r"(\b\w+\b)(?:\s+\1){3,}", tail, re.IGNORECASE))
+    rep_score = -0.2 * min(reps, 3)
+
+    # presence of a numeric/letter final answer often desired in math/QA
+    has_number = bool(re.search(r"[-+]?\d[\d,\.]*", tail))
+    fa_score = 0.1 if has_number else 0.0
+
+    # cheap “tool call” hallucination penalty
+    tool_like = bool(re.search(r"<\s*(tool|function|call)[^>]*>", tail, re.IGNORECASE))
+    tool_pen = -0.2 if tool_like else 0.0
+
+    score = len_score + rep_score + fa_score + tool_pen
+    return float(max(-1.0, min(1.0, score)))
+
+# ======================= PPO (LoRA-only training) =======================
+
+def build_ppo_policy_with_lora(args: Args, tokenizer: AutoTokenizer) -> AutoModelForCausalLMWithValueHead:
+    """
+    Load base (optionally 4-bit), attach value head, then load SFT LoRA adapters.
+    Freeze base; train LoRA + v_head only.
+    """
+    model = AutoModelForCausalLMWithValueHead.from_pretrained(
+        args.base_model_id,
         torch_dtype=torch.bfloat16,
         device_map="auto",
         low_cpu_mem_usage=True,
+        load_in_4bit=args.load_in_4bit,
+        bnb_4bit_use_double_quant=True if args.load_in_4bit else None,
+        bnb_4bit_compute_dtype=torch.bfloat16 if args.load_in_4bit else None,
     )
-    inc = tok.convert_tokens_to_ids("<INCORRECT>")
-    cor = tok.convert_tokens_to_ids("<CORRECT>")
-    step = tok.convert_tokens_to_ids("<STEP>")
-    if inc == tok.unk_token_id or cor == tok.unk_token_id:
-        raise ValueError("Reward model lacks <CORRECT>/<INCORRECT> tokens")
-    if step == tok.unk_token_id:
-        step = tok.eos_token_id
-    return tok, mdl, inc, cor, step
 
-
-def compute_step_scores(text: str, tok: AutoTokenizer, mdl: AutoModelForCausalLM, inc_id: int, cor_id: int, step_id: int, device: str) -> float:
-    m = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
-    content = m.group(1) if m else text
-    formatted = (" \n\n\n\n".join(ln.strip() for ln in content.split("\n")) + " \n\n\n\n")
-    batch = tok([formatted], return_tensors="pt", padding=True)
-    batch = {k: v.to(device) for k, v in batch.items()}
-    with torch.no_grad():
-        logits = mdl(**batch).logits[..., [inc_id, cor_id]]
-        probs = logits.softmax(-1)[..., 1]
-    mask = (batch["input_ids"] == step_id).float()
-    denom = mask.sum().item()
-    if denom < 1:
-        return probs.mean().item()
-    return (probs * mask).sum().item() / denom
-
-# ----------------------- PPO -----------------------
-
-def ppo_train(args: Args, merged_path: str, sft_prompts: List[str]):
-    tok = prepare_tokenizer(merged_path)
-    ppo_model = AutoModelForCausalLMWithValueHead.from_pretrained(
-        merged_path,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
+    model.pretrained_model = PeftModel.from_pretrained(
+        model.pretrained_model,
+        args.lora_ckpt_dir,
+        is_trainable=True,
     )
-    ref_model = create_reference_model(ppo_model)
 
-    r_tok, r_mdl, inc_id, cor_id, step_id = build_reward(args)
+    # Freeze all, then unfreeze LoRA + v_head
+    for n, p in model.named_parameters():
+        p.requires_grad = False
+    for n, p in model.named_parameters():
+        if "lora_" in n or n.startswith("v_head"):
+            p.requires_grad = True
+
+    if tokenizer.pad_token_id is not None:
+        model.config.pad_token_id = tokenizer.pad_token_id
+    if tokenizer.eos_token_id is not None:
+        model.config.eos_token_id = tokenizer.eos_token_id
+
+    return model
+
+def anneal_target_kl(kind: str, epoch_idx: int, total_epochs: int, kl_min: float, kl_max: float) -> float:
+    if kind == "none" or total_epochs <= 1:
+        return kl_max
+    t = epoch_idx / (total_epochs - 1 + 1e-8)
+    if kind == "linear":
+        return kl_max + (kl_min - kl_max) * t
+    if kind == "cosine":
+        return kl_min + 0.5*(kl_max - kl_min)*(1 + np.cos(np.pi * (1 - t)))
+    return kl_max
+
+def parse_final_answer(text: str) -> Optional[str]:
+    # pull text after </think>, then look for last number or an answer line
+    tail = text.split("</think>")[-1] if "</think>" in text else text
+    tail = tail.strip()
+    m = re.search(r"####\s*(.*)$", tail, re.MULTILINE)
+    if m:
+        return m.group(1).strip()
+    nums = re.findall(r"[-+]?\d[\d,\.]*", tail)
+    if nums:
+        return nums[-1]
+    # fallback last non-empty line
+    lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
+    return lines[-1] if lines else None
+
+def evaluate_gsm8k_em(model: AutoModelForCausalLM, tok: AutoTokenizer, n: int = 128, device: str = "cuda") -> Dict[str, Any]:
+    try:
+        ref = load_dataset("openai/gsm8k", "main", split="test")
+    except Exception:
+        return {"em": None, "n": 0}
+
+    ref = ref.select(range(min(n, len(ref))))
+    correct = 0
+    total = len(ref)
+    for ex in ref:
+        q = ex["question"].strip()
+        ans = ex["answer"].strip()
+        with torch.no_grad():
+            enc = tok([q], return_tensors="pt").to(device)
+            out = model.generate(**enc, max_new_tokens=256, do_sample=False, eos_token_id=tok.eos_token_id, pad_token_id=tok.pad_token_id)
+        text = tok.decode(out[0], skip_special_tokens=True)
+        pred = parse_final_answer(text) or ""
+        # normalize numbers in GSM8K (strip final explanation after final answer)
+        gold_nums = re.findall(r"[-+]?\d[\d,\.]*", ans)
+        gold = gold_nums[-1] if gold_nums else ans.strip()
+        pred_nums = re.findall(r"[-+]?\d[\d,\.]*", pred)
+        predn = pred_nums[-1] if pred_nums else pred.strip()
+        correct += int(predn == gold)
+    return {"em": correct / max(1, total), "n": total}
+
+def ppo_train(args: Args, sft_dataset: Dataset):
+    tok = prepare_tokenizer(args.base_model_id, left_pad=True)
+    policy = build_ppo_policy_with_lora(args, tok)
+    ref_model = None if args.ref_free else create_reference_model(policy)
+
+    prm = VersaPRM(args.reward_model_id, device=args.device)
 
     cfg = PPOConfig(
-        model_name="gemma3_cot_sft",
+        model_name="gemma3_cot_ppo_on_lora",
         learning_rate=args.ppo_lr,
         batch_size=args.ppo_batch_size,
         mini_batch_size=args.ppo_mini_bs,
         adaptive_kl_ctrl=True,
         target_kl=args.ppo_target_kl,
         ppo_epochs=args.ppo_epochs,
+        entropy_beta=args.entropy_beta,
     )
 
-    trainer = PPOTrainer(config=cfg, model=ppo_model, ref_model=ref_model, tokenizer=tok)
+    trainer = PPOTrainer(config=cfg, model=policy, ref_model=ref_model, tokenizer=tok)
 
-    # JSONL logging
+    # graceful stop + JSONL
+    os.makedirs(args.output_dir, exist_ok=True)
     jsonl_path = os.path.join(args.output_dir, args.jsonl_log)
     def log_jsonl(rec: Dict[str, Any]):
         with open(jsonl_path, "a", encoding="utf-8") as f:
@@ -497,77 +633,165 @@ def ppo_train(args: Args, merged_path: str, sft_prompts: List[str]):
 
     stop_flag = {"stop": False}
     def handle_sigint(sig, frame):
-        print("\n[INFO] Caught signal, saving PPO model and exiting...")
-        trainer.save_pretrained(os.path.join(args.output_dir, "ppo"))
+        print("\n[INFO] Caught signal, saving PPO LoRA and exiting...")
+        if isinstance(policy.pretrained_model, PeftModel):
+            policy.pretrained_model.save_pretrained(args.ppo_lora_dir)
         stop_flag["stop"] = True
     signal.signal(signal.SIGINT, handle_sigint)
     signal.signal(signal.SIGTERM, handle_sigint)
 
-    prompts = sft_prompts
+    prompts = sft_dataset["prompt"]
     bs = args.ppo_batch_size
     global_step = 0
+
+    gen_kwargs = dict(
+        max_new_tokens=args.ppo_max_new_tokens,
+        do_sample=True,
+        temperature=args.gen_temperature,
+        top_p=args.gen_top_p,
+        top_k=args.gen_top_k,
+        repetition_penalty=args.repetition_penalty,
+        length_penalty=args.length_penalty,
+        min_new_tokens=args.min_new_tokens,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+    )
+
+    def slice_response(full_seq: torch.Tensor, padded_input_len: int) -> torch.Tensor:
+        return full_seq[padded_input_len:]
+
     for epoch in range(args.ppo_epochs):
-        if stop_flag["stop"]: break
+        if stop_flag["stop"]:
+            break
+
+        # KL anneal (if available, set trainer.kl_ctl.target dynamically)
+        new_target = anneal_target_kl(args.kl_anneal, epoch, args.ppo_epochs, args.kl_min, args.kl_max)
+        try:
+            if hasattr(trainer, "kl_ctl") and hasattr(trainer.kl_ctl, "target"):
+                trainer.kl_ctl.target = float(new_target)
+        except Exception:
+            pass
+
         for i in range(0, len(prompts), bs):
-            if stop_flag["stop"]: break
+            if stop_flag["stop"]:
+                break
+
             batch_prompts = prompts[i : i + bs]
-            batch_inputs = tok(batch_prompts, return_tensors="pt", padding=True).to(args.device)
+            enc = tok(batch_prompts, return_tensors="pt", padding=True).to(args.device)
+            attn = enc["attention_mask"]
+            padded_len = enc["input_ids"].shape[1]
 
-            # Generate once, or multiple times for reward smoothing
-            texts_all: List[str] = []
-            rewards_all: List[float] = []
-            samples = max(1, args.reward_samples)
-            for s in range(samples):
+            num_samples = max(1, args.reward_samples)
+            last_query_tensors, last_response_tensors = None, None
+            rewards_accum: List[List[float]] = [[] for _ in range(len(batch_prompts))]
+            dec_texts_cache: List[str] = [""] * len(batch_prompts)
+
+            for s in range(num_samples):
                 with torch.no_grad():
-                    gen = ppo_model.generate(
-                        **batch_inputs,
-                        max_new_tokens=args.ppo_max_new_tokens,
-                        do_sample=True,
-                        temperature=args.gen_temperature if samples == 1 else args.reward_temperature,
-                        top_p=args.gen_top_p,
-                        top_k=args.gen_top_k,
-                        repetition_penalty=args.repetition_penalty,
-                        length_penalty=args.length_penalty,
-                        min_new_tokens=args.min_new_tokens,
-                        eos_token_id=tok.eos_token_id,
-                    )
-                texts = tok.batch_decode(gen, skip_special_tokens=True)
-                rewards = [
-                    compute_step_scores(t, r_tok, r_mdl, inc_id, cor_id, step_id, args.device) for t in texts
-                ]
-                texts_all.append("\n".join(texts))  # for logging (collapsed)
-                rewards_all.append(float(np.mean(rewards)))
+                    gen = policy.generate(**enc, **gen_kwargs)
 
-            reward_value = float(np.mean(rewards_all))
-            # One query/response per prompt for PPO step; we use last generation
-            query_tensors = [batch_inputs["input_ids"][j] for j in range(len(batch_prompts))]
-            response_tensors = [gen[j] for j in range(len(batch_prompts))]
-            stats = trainer.step(query_tensors, response_tensors, [reward_value] * len(batch_prompts))
+                query_tensors = []
+                response_tensors = []
+                decoded_texts = []
+
+                for j in range(len(batch_prompts)):
+                    in_len = int(attn[j].sum().item())
+                    full = gen[j]
+                    query = enc["input_ids"][j, -in_len:].detach()
+                    resp = full[in_len:].detach()
+                    query_tensors.append(query)
+                    response_tensors.append(resp)
+                    dec_text = tok.decode(full, skip_special_tokens=False)
+                    decoded_texts.append(dec_text)
+
+                # Score each prompt
+                for j, text in enumerate(decoded_texts):
+                    think = extract_think(text)
+                    prm_score = prm.score(batch_prompts[j], think)
+                    rule_score = rule_safety_reward(batch_prompts[j], text)
+                    total = args.reward_w_prm * prm_score + args.reward_w_rule * rule_score
+                    # clip if desired
+                    total = max(args.reward_clip_min, min(args.reward_clip_max, total))
+                    rewards_accum[j].append(float(total))
+                    dec_texts_cache[j] = text  # keep last
+
+                last_query_tensors = query_tensors
+                last_response_tensors = response_tensors
+
+            # mean over samples per prompt
+            final_rewards = [float(np.mean(rs)) if len(rs) > 0 else 0.0 for rs in rewards_accum]
+
+            # PPO step
+            stats = trainer.step(last_query_tensors, last_response_tensors, final_rewards)
             global_step += 1
 
+            # logging
             log_jsonl({
                 "epoch": epoch,
                 "global_step": global_step,
                 "batch_index": i // bs,
-                "reward": reward_value,
-                "stats": {k: (float(v) if isinstance(v, (int, float)) else v) for k, v in stats.items()},
+                "reward_mean": float(np.mean(final_rewards)),
+                "reward_min": float(np.min(final_rewards)),
+                "reward_max": float(np.max(final_rewards)),
+                "kl_target": float(new_target),
+                "kl": float(stats.get("kl", 0.0)),
+                "entropy_beta": args.entropy_beta,
+                "loss/policy": float(stats.get("loss/policy", 0.0)) if isinstance(stats.get("loss/policy", 0.0), (int,float)) else 0.0,
+                "loss/value": float(stats.get("loss/value", 0.0)) if isinstance(stats.get("loss/value", 0.0), (int,float)) else 0.0,
             })
-        print(f"[PPO] finished epoch {epoch+1}/{args.ppo_epochs}")
 
-    final_dir = os.path.join(args.output_dir, "ppo_final")
+            # periodic eval (optional)
+            if args.eval_every and (global_step % args.eval_every == 0):
+                try:
+                    eval_res = evaluate_gsm8k_em(policy.pretrained_model, tok, n=args.eval_gsm8k_n, device=args.device)
+                except Exception:
+                    # if model is wrapped, fall back to full policy
+                    eval_res = evaluate_gsm8k_em(policy, tok, n=args.eval_gsm8k_n, device=args.device)
+                log_jsonl({"eval_step": global_step, "gsm8k_em": eval_res.get("em"), "gsm8k_n": eval_res.get("n")})
+                print(f"[EVAL] step {global_step}: GSM8K EM={eval_res.get('em')} on n={eval_res.get('n')}")
+
+        print(f"[PPO] finished epoch {epoch+1}/{args.ppo_epochs} (KL target now {new_target:.3f})")
+
+    # Save PPO LoRA adapters
+    os.makedirs(args.ppo_lora_dir, exist_ok=True)
+    if isinstance(policy.pretrained_model, PeftModel):
+        policy.pretrained_model.save_pretrained(args.ppo_lora_dir)
+    tok.save_pretrained(args.ppo_lora_dir)
+
+    # Save PPO policy wrapper too (resume PPO)
+    final_dir = os.path.join(args.output_dir, "ppo_final_policy")
     trainer.save_pretrained(final_dir)
-    ppo_model.save_pretrained(
-        final_dir,
-        safe_serialization=True,
-        max_shard_size=args.max_shard_size,
-    )
-    tok.save_pretrained(final_dir)
+
+    # Push adapters if asked
     if args.hf_repo:
         api = HfApi(token=args.hf_token)
         api.create_repo(args.hf_repo, exist_ok=True)
-        api.upload_folder(folder_path=final_dir, repo_id=args.hf_repo)
+        api.upload_folder(folder_path=args.ppo_lora_dir, repo_id=args.hf_repo)
 
-# ----------------------- Manifest -----------------------
+# ======================= Merge after PPO =======================
+
+def merge_after_ppo(args: Args) -> str:
+    print("[MERGE] Loading base and PPO LoRA for final merge...")
+    base = AutoModelForCausalLM.from_pretrained(
+        args.base_model_id,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        low_cpu_mem_usage=True,
+    )
+    peft_model = PeftModel.from_pretrained(base, args.ppo_lora_dir, is_trainable=False)
+    merged = peft_model.merge_and_unload()
+    os.makedirs(args.merged_path, exist_ok=True)
+    merged.save_pretrained(args.merged_path, safe_serialization=True, max_shard_size=args.max_shard_size)
+    tok = AutoTokenizer.from_pretrained(args.base_model_id, use_fast=True)
+    tok.add_special_tokens({"additional_special_tokens": ["<think>", "</think>"]})
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    tok.save_pretrained(args.merged_path)
+    torch.cuda.empty_cache()
+    print(f"[MERGE] Saved merged model to {args.merged_path}")
+    return args.merged_path
+
+# ======================= Manifest =======================
 
 def library_versions() -> Dict[str, Any]:
     import transformers, datasets as hf_datasets, trl as trl_lib
@@ -586,7 +810,6 @@ def library_versions() -> Dict[str, Any]:
         "unsloth": unsloth_version,
     }
 
-
 def gpu_info() -> List[Dict[str, Any]]:
     infos: List[Dict[str, Any]] = []
     if torch.cuda.is_available():
@@ -599,7 +822,6 @@ def gpu_info() -> List[Dict[str, Any]]:
                 "capability": f"{props.major}.{props.minor}",
             })
     return infos
-
 
 def write_manifest(args: Args, stage: str, extra: Dict[str, Any]) -> None:
     os.makedirs(args.output_dir, exist_ok=True)
@@ -617,7 +839,7 @@ def write_manifest(args: Args, stage: str, extra: Dict[str, Any]) -> None:
         json.dump(manifest, f, indent=2)
     print(f"[MANIFEST] wrote {path}")
 
-# ----------------------- Main -----------------------
+# ======================= Main =======================
 
 def main(argv: List[str]):
     args = parse_args(argv)
@@ -626,19 +848,26 @@ def main(argv: List[str]):
 
     write_manifest(args, stage="start", extra={})
 
-    merged_path = args.merged_path
     if args.run_sft:
-        merged_path = sft_train(args)
-        write_manifest(args, stage="post_sft", extra={"merged_path": merged_path})
+        sft_dir = sft_train(args)  # saves adapters to lora_ckpt_dir
+        write_manifest(args, stage="post_sft", extra={"sft_lora_dir": sft_dir})
     else:
-        print("RUN_SFT=False – skipping SFT and loading existing merged model.")
+        print("[INFO] Skipping SFT; expecting existing adapters in --lora-ckpt-dir")
 
+    # PPO dataset
     ds = build_sft_dataset(args)
     n = min(128000, len(ds))
-    rl_prompts = ds.shuffle(seed=args.seed).select(range(n))["prompt"]
+    rl_ds = ds.shuffle(seed=args.seed).select(range(n))
 
-    ppo_train(args, merged_path, rl_prompts)
-    write_manifest(args, stage="done", extra={"merged_path": merged_path})
+    # PPO on LoRA adapters (with extras)
+    ppo_train(args, rl_ds)
+    write_manifest(args, stage="post_ppo", extra={"ppo_lora_dir": args.ppo_lora_dir})
+
+    if args.run_merge_after_ppo:
+        merged = merge_after_ppo(args)
+        write_manifest(args, stage="done", extra={"merged_path": merged})
+    else:
+        write_manifest(args, stage="done", extra={"merged_path": None})
 
 if __name__ == "__main__":
     main(sys.argv[1:])

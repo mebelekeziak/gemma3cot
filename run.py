@@ -746,12 +746,12 @@ def ppo_train(args: Args, sft_dataset: Dataset):
     # -------- FIX HERE: drop unsupported PPOConfig arg ----------
     cfg = PPOConfig(
         learning_rate=args.ppo_lr,
-        batch_size=args.ppo_batch_size,
-        mini_batch_size=args.ppo_mini_bs,
-        target_kl=args.ppo_target_kl,
-        ppo_epochs=args.ppo_epochs,
-        entropy_beta=args.entropy_beta,
+        batch_size=args.ppo_batch_size,      # still supported
+        mini_batch_size=args.ppo_mini_bs,    # still supported
+        num_ppo_epochs=args.ppo_epochs,      # <- renamed
+        kl_coef=0.05                         # <- replaces target_kl; tune 0.02–0.1
     )
+
     # ------------------------------------------------------------
 
     trainer = PPOTrainer(config=cfg, model=policy, ref_model=ref_model, tokenizer=tok)
@@ -794,13 +794,6 @@ def ppo_train(args: Args, sft_dataset: Dataset):
     for epoch in range(args.ppo_epochs):
         if stop_flag["stop"]:
             break
-
-        new_target = anneal_target_kl(args.kl_anneal, epoch, args.ppo_epochs, args.kl_min, args.kl_max)
-        try:
-            if hasattr(trainer, "kl_ctl") and hasattr(trainer.kl_ctl, "target"):
-                trainer.kl_ctl.target = float(new_target)
-        except Exception:
-            pass
 
         for i in range(0, len(prompts), bs):
             if stop_flag["stop"]:
@@ -857,7 +850,6 @@ def ppo_train(args: Args, sft_dataset: Dataset):
                 "reward_mean": float(np.mean(final_rewards)),
                 "reward_min": float(np.min(final_rewards)),
                 "reward_max": float(np.max(final_rewards)),
-                "kl_target": float(new_target),
                 "kl": float(stats.get("kl", 0.0)),
                 "entropy_beta": args.entropy_beta,
                 "loss/policy": float(stats.get("loss/policy", 0.0)) if isinstance(stats.get("loss/policy", 0.0), (int,float)) else 0.0,
@@ -872,7 +864,7 @@ def ppo_train(args: Args, sft_dataset: Dataset):
                 log_jsonl({"eval_step": global_step, "gsm8k_em": eval_res.get("em"), "gsm8k_n": eval_res.get("n")})
                 print(f"[EVAL] step {global_step}: GSM8K EM={eval_res.get('em')} on n={eval_res.get('n')}")
 
-        print(f"[PPO] finished epoch {epoch+1}/{args.ppo_epochs} (KL target now {new_target:.3f})")
+        print(f"[PPO] finished epoch {epoch+1}/{args.ppo_epochs}")
 
     os.makedirs(args.ppo_lora_dir, exist_ok=True)
     if isinstance(policy.pretrained_model, PeftModel):

@@ -433,38 +433,122 @@ def sft_train(args: Args) -> str:
 
 class VersaPRM:
     """
-    VersaPRM recipe:
-      - candidate token ids [INCORRECT, CORRECT] = [12, 10]
-      - step positions are the token id of " \\n\\n\\n\\n" (computed from tokenizer)
-      - input = question + " \\n\\n" + " \\n\\n\\n\\n".join(steps) + " \\n\\n\\n\\n"
+    VersaPRM scoring:
+      - After each reasoning step, the PRM expects a label token ('CORRECT' / 'INCORRECT').
+      - We build: input = question + " \\n\\n" + (" \\n\\n\\n\\n".join(steps)) + " \\n\\n\\n\\n"
+      - We find every occurrence of the full delimiter " \\n\\n\\n\\n" in the tokenized input,
+        and at the index of its final token we read the NEXT-token distribution (logits[t])
+        and softmax over the two label tokens to get P(CORRECT). We then average across steps.
     """
-    def __init__(self, model_id: str, device: str):
+    def __init__(
+        self,
+        model_id: str,
+        device: str,
+        correct_label_candidates=(" CORRECT", " Correct", " correct", " YES", " Yes", " yes", " True", " true"),
+        incorrect_label_candidates=(" INCORRECT", " Incorrect", " incorrect", " NO", " No", " no", " False", " false"),
+        step_delim: str = " \n\n\n\n",
+    ):
         self.tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
-        self.tok.pad_token = self.tok.eos_token
+        if self.tok.eos_token is None:
+            # be defensive; some bases miss eos
+            if self.tok.sep_token is not None:
+                self.tok.eos_token = self.tok.sep_token
+            else:
+                self.tok.add_special_tokens({"eos_token": "</s>"})
+        if self.tok.pad_token is None:
+            self.tok.pad_token = self.tok.eos_token
         self.tok.padding_side = "left"
         self.tok.truncation_side = "left"
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=torch.bfloat16, device_map="auto", low_cpu_mem_usage=True
-        )
-        self.candidate_ids = [12, 10]
-        step_seq = self.tok.encode(" \n\n\n\n", add_special_tokens=False)
-        self.step_id = step_seq[-1] if len(step_seq) > 0 else self.tok.eos_token_id
-        self.device = device
 
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            low_cpu_mem_usage=True,
+        )
+        self.model.eval()
+
+        self.step_delim = step_delim
+        self.step_ids = self.tok.encode(self.step_delim, add_special_tokens=False)
+
+        # Resolve candidate ids robustly across tokenizers
+        self.candidate_ids = self._resolve_candidate_ids(
+            correct_label_candidates, incorrect_label_candidates
+        )  # order: [INCORRECT, CORRECT]
+
+    def _pick_single_token_id(self, candidates) -> Optional[int]:
+        """Return a single-token id for the first candidate string that tokenizes to length 1.
+        If none do, return None."""
+        for s in candidates:
+            ids = self.tok.encode(s, add_special_tokens=False)
+            if len(ids) == 1:
+                return ids[0]
+        return None
+
+    def _fallback_last_id(self, s: str) -> int:
+        """Fallback: use the last sub-token id of the label string. This still aligns with next-token logits."""
+        ids = self.tok.encode(s, add_special_tokens=False)
+        return ids[-1]
+
+    def _resolve_candidate_ids(self, correct_cands, incorrect_cands):
+        correct_id = self._pick_single_token_id(correct_cands)
+        incorrect_id = self._pick_single_token_id(incorrect_cands)
+
+        # If single-token forms aren't found, fall back to last sub-token of the first candidate in each list.
+        if correct_id is None:
+            correct_id = self._fallback_last_id(correct_cands[0])
+        if incorrect_id is None:
+            incorrect_id = self._fallback_last_id(incorrect_cands[0])
+
+        # Order must be [INCORRECT, CORRECT] to match softmax index 1 == CORRECT below.
+        return [incorrect_id, correct_id]
+
+    def _find_delim_tail_positions(self, input_ids_1d: torch.Tensor):
+        """Return indices of the last token of each delimiter subsequence."""
+        ids = input_ids_1d.tolist()
+        sub = self.step_ids
+        L, M = len(ids), len(sub)
+        positions = []
+        if M == 0:
+            return positions
+        for i in range(L - M + 1):
+            if ids[i : i + M] == sub:
+                positions.append(i + M - 1)
+        return positions
+
+    @torch.no_grad()
     def score(self, question: str, steps_text: str) -> float:
+        # Parse steps; ignore empty lines
         raw_lines = [ln.strip() for ln in (steps_text or "").split("\n") if ln.strip()]
         if not raw_lines:
             return 0.0
-        joined = " \n\n\n\n".join(raw_lines) + " \n\n\n\n"
+
+        # Build PRM input
+        joined = self.step_delim.join(raw_lines) + self.step_delim
         input_text = (question or "").strip() + " \n\n" + joined
-        input_ids = torch.tensor([self.tok.encode(input_text)], device=self.device)
-        with torch.no_grad():
-            logits = self.model(input_ids).logits[:, :, self.candidate_ids]
-            probs_correct = torch.softmax(logits, dim=-1)[:, :, 1]
-        mask = (input_ids == self.step_id).float()
-        if mask.sum().item() < 1:
-            return probs_correct.mean().item()
-        return (probs_correct * mask).sum().item() / mask.sum().item()
+
+        # Use the model's first parameter device (safe for device_map='auto')
+        device = next(self.model.parameters()).device
+        ids = self.tok.encode(input_text, add_special_tokens=False)
+        input_ids = torch.tensor([ids], device=device)
+
+        # Forward
+        out = self.model(input_ids)
+        # Gather logits for [INCORRECT, CORRECT]
+        cand_logits = torch.stack(
+            [out.logits[:, :, cid] for cid in self.candidate_ids], dim=-1
+        )  # [1, T, 2]
+        probs = torch.softmax(cand_logits, dim=-1)[0]  # [T, 2]
+
+        # Read positions immediately after each delimiter (use logits at the index of the delimiter tail)
+        pos_idx = self._find_delim_tail_positions(input_ids[0])
+
+        if not pos_idx:
+            # Fallback: average over the tail region where labels likely appear
+            tail_len = min(64, probs.shape[0])
+            return float(probs[-tail_len:, 1].mean().item())
+
+        return float(probs[pos_idx, 1].mean().item())
 
 def extract_think(text: str) -> str:
     text = _normalize_angle_tags(text or "")

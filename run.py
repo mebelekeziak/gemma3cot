@@ -14,6 +14,7 @@ from transformers import (
     AutoModelForCausalLM,
     TrainingArguments,
     Trainer,
+    BitsAndBytesConfig,  # <<< added
 )
 from trl import (
     AutoModelForCausalLMWithValueHead,
@@ -45,7 +46,7 @@ def set_seed(seed: int) -> None:
 @dataclass
 class Args:
     # Base + reward
-    base_model_id: str = os.environ.get("BASE_MODEL_ID", "google/gemma-3-27b-int")
+    base_model_id: str = os.environ.get("BASE_MODEL_ID", "google/gemma-3-27b-it")
     reward_model_id: str = os.environ.get("REWARD_MODEL_ID", "UW-Madison-Lee-Lab/VersaPRM-Base-3B")
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -604,19 +605,39 @@ def rule_safety_reward(prompt: str, output: str) -> float:
 
 # ======================= PPO (LoRA-only training) =======================
 
+def _bf16_supported() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    major, _ = torch.cuda.get_device_capability()
+    return major >= 8  # Ampere+ supports BF16
+
 def build_ppo_policy_with_lora(args: Args, tokenizer: AutoTokenizer) -> AutoModelForCausalLMWithValueHead:
     """
     Load base (optionally 4-bit), attach value head, then load SFT LoRA adapters.
     Freeze base; train LoRA + v_head only.
+    NOTE: Use BitsAndBytesConfig when quantizing; do NOT pass bnb_4bit_* directly.
     """
-    model = AutoModelForCausalLMWithValueHead.from_pretrained(
-        args.base_model_id,
-        torch_dtype=torch.bfloat16,
+    use_bf16 = _bf16_supported()
+    dtype = torch.bfloat16 if use_bf16 else torch.float32
+
+    model_kwargs: Dict[str, Any] = dict(
+        torch_dtype=dtype,
         device_map="auto",
         low_cpu_mem_usage=True,
-        load_in_4bit=args.load_in_4bit,
-        bnb_4bit_use_double_quant=True if args.load_in_4bit else None,
-        bnb_4bit_compute_dtype=torch.bfloat16 if args.load_in_4bit else None,
+    )
+
+    if args.load_in_4bit:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=(torch.bfloat16 if use_bf16 else torch.float32),
+            bnb_4bit_quant_type="nf4",
+        )
+        model_kwargs["quantization_config"] = bnb_config
+
+    model = AutoModelForCausalLMWithValueHead.from_pretrained(
+        args.base_model_id,
+        **model_kwargs,
     )
 
     model.pretrained_model = PeftModel.from_pretrained(

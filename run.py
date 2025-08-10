@@ -11,10 +11,9 @@ from datasets import load_dataset, concatenate_datasets, Dataset
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
-    AutoModelForCausalLM,
     TrainingArguments,
     Trainer,
-    BitsAndBytesConfig,  # <<< added
+    BitsAndBytesConfig,
 )
 from trl import (
     AutoModelForCausalLMWithValueHead,
@@ -210,7 +209,6 @@ def parse_args(argv: List[str]) -> Args:
     for k, v in vars(ns).items():
         if v is not None:
             setattr(args, k, v)
-    # keep ppo_target_kl consistent with kl_max default
     if args.kl_anneal != "none":
         args.ppo_target_kl = args.kl_max
     return args
@@ -451,7 +449,6 @@ class VersaPRM:
     ):
         self.tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
         if self.tok.eos_token is None:
-            # be defensive; some bases miss eos
             if self.tok.sep_token is not None:
                 self.tok.eos_token = self.tok.sep_token
             else:
@@ -472,14 +469,11 @@ class VersaPRM:
         self.step_delim = step_delim
         self.step_ids = self.tok.encode(self.step_delim, add_special_tokens=False)
 
-        # Resolve candidate ids robustly across tokenizers
         self.candidate_ids = self._resolve_candidate_ids(
             correct_label_candidates, incorrect_label_candidates
         )  # order: [INCORRECT, CORRECT]
 
     def _pick_single_token_id(self, candidates) -> Optional[int]:
-        """Return a single-token id for the first candidate string that tokenizes to length 1.
-        If none do, return None."""
         for s in candidates:
             ids = self.tok.encode(s, add_special_tokens=False)
             if len(ids) == 1:
@@ -487,25 +481,19 @@ class VersaPRM:
         return None
 
     def _fallback_last_id(self, s: str) -> int:
-        """Fallback: use the last sub-token id of the label string. This still aligns with next-token logits."""
         ids = self.tok.encode(s, add_special_tokens=False)
         return ids[-1]
 
     def _resolve_candidate_ids(self, correct_cands, incorrect_cands):
         correct_id = self._pick_single_token_id(correct_cands)
         incorrect_id = self._pick_single_token_id(incorrect_cands)
-
-        # If single-token forms aren't found, fall back to last sub-token of the first candidate in each list.
         if correct_id is None:
             correct_id = self._fallback_last_id(correct_cands[0])
         if incorrect_id is None:
             incorrect_id = self._fallback_last_id(incorrect_cands[0])
-
-        # Order must be [INCORRECT, CORRECT] to match softmax index 1 == CORRECT below.
         return [incorrect_id, correct_id]
 
     def _find_delim_tail_positions(self, input_ids_1d: torch.Tensor):
-        """Return indices of the last token of each delimiter subsequence."""
         ids = input_ids_1d.tolist()
         sub = self.step_ids
         L, M = len(ids), len(sub)
@@ -519,36 +507,23 @@ class VersaPRM:
 
     @torch.no_grad()
     def score(self, question: str, steps_text: str) -> float:
-        # Parse steps; ignore empty lines
         raw_lines = [ln.strip() for ln in (steps_text or "").split("\n") if ln.strip()]
         if not raw_lines:
             return 0.0
-
-        # Build PRM input
         joined = self.step_delim.join(raw_lines) + self.step_delim
         input_text = (question or "").strip() + " \n\n" + joined
-
-        # Use the model's first parameter device (safe for device_map='auto')
         device = next(self.model.parameters()).device
         ids = self.tok.encode(input_text, add_special_tokens=False)
         input_ids = torch.tensor([ids], device=device)
-
-        # Forward
         out = self.model(input_ids)
-        # Gather logits for [INCORRECT, CORRECT]
         cand_logits = torch.stack(
             [out.logits[:, :, cid] for cid in self.candidate_ids], dim=-1
-        )  # [1, T, 2]
-        probs = torch.softmax(cand_logits, dim=-1)[0]  # [T, 2]
-
-        # Read positions immediately after each delimiter (use logits at the index of the delimiter tail)
+        )
+        probs = torch.softmax(cand_logits, dim=-1)[0]
         pos_idx = self._find_delim_tail_positions(input_ids[0])
-
         if not pos_idx:
-            # Fallback: average over the tail region where labels likely appear
             tail_len = min(64, probs.shape[0])
             return float(probs[-tail_len:, 1].mean().item())
-
         return float(probs[pos_idx, 1].mean().item())
 
 def extract_think(text: str) -> str:
@@ -564,42 +539,24 @@ BAD_PHRASES = [
 ]
 
 def rule_safety_reward(prompt: str, output: str) -> float:
-    """
-    Very light heuristic reward, scaled to ~[-1, 1]:
-    + format sanity (has final answer token, not absurdly long, no repetition spam)
-    - penalize refusal phrases, empty answers, or hallucinated tool calls
-    """
     if not output or not output.strip():
         return -0.5
-
-    # Try to find final answer after </think>
     tail = output.split("</think>")[-1] if "</think>" in output else output
     tail = tail.strip()
-
-    # penalize obvious refusals
     if any(p.lower() in output.lower() for p in BAD_PHRASES):
         return -0.5
-
-    # length sanity
     tok_est = len(re.findall(r"\S+", tail))
     len_score = 0.0
     if 1 <= tok_est <= 200:
         len_score = 0.2
     elif tok_est > 500:
         len_score = -0.2
-
-    # repetition penalty (very crude)
     reps = sum(1 for m in re.finditer(r"(\b\w+\b)(?:\s+\1){3,}", tail, re.IGNORECASE))
     rep_score = -0.2 * min(reps, 3)
-
-    # presence of a numeric/letter final answer often desired in math/QA
     has_number = bool(re.search(r"[-+]?\d[\d,\.]*", tail))
     fa_score = 0.1 if has_number else 0.0
-
-    # cheap “tool call” hallucination penalty
     tool_like = bool(re.search(r"<\s*(tool|function|call)[^>]*>", tail, re.IGNORECASE))
     tool_pen = -0.2 if tool_like else 0.0
-
     score = len_score + rep_score + fa_score + tool_pen
     return float(max(-1.0, min(1.0, score)))
 
@@ -615,7 +572,6 @@ def build_ppo_policy_with_lora(args: Args) -> Tuple[AutoModelForCausalLMWithValu
     use_bf16 = _bf16_supported()
     dtype = torch.bfloat16 if use_bf16 else torch.float32
 
-    # Always use the tokenizer saved alongside the SFT LoRA (has the extra tokens)
     tok = AutoTokenizer.from_pretrained(args.lora_ckpt_dir, use_fast=True)
     if tok.eos_token is None:
         if tok.sep_token is not None:
@@ -645,20 +601,17 @@ def build_ppo_policy_with_lora(args: Args) -> Tuple[AutoModelForCausalLMWithValu
         **model_kwargs,
     )
 
-    # 🔧 Make base vocab match the SFT tokenizer BEFORE loading LoRA
     new_vocab = len(tok)
     base_vocab = policy.pretrained_model.get_input_embeddings().weight.shape[0]
     if new_vocab != base_vocab:
         policy.pretrained_model.resize_token_embeddings(new_vocab)
 
-    # Load LoRA adapters (now shapes line up)
     policy.pretrained_model = PeftModel.from_pretrained(
         policy.pretrained_model,
         args.lora_ckpt_dir,
         is_trainable=True,
     )
 
-    # Freeze base, train LoRA + value head only
     for n, p in policy.named_parameters():
         p.requires_grad = False
     for n, p in policy.named_parameters():
@@ -681,7 +634,6 @@ def anneal_target_kl(kind: str, epoch_idx: int, total_epochs: int, kl_min: float
     return kl_max
 
 def parse_final_answer(text: str) -> Optional[str]:
-    # pull text after </think>, then look for last number or an answer line
     tail = text.split("</think>")[-1] if "</think>" in text else text
     tail = tail.strip()
     m = re.search(r"####\s*(.*)$", tail, re.MULTILINE)
@@ -690,7 +642,6 @@ def parse_final_answer(text: str) -> Optional[str]:
     nums = re.findall(r"[-+]?\d[\d,\.]*", tail)
     if nums:
         return nums[-1]
-    # fallback last non-empty line
     lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
     return lines[-1] if lines else None
 
@@ -711,7 +662,6 @@ def evaluate_gsm8k_em(model: AutoModelForCausalLM, tok: AutoTokenizer, n: int = 
             out = model.generate(**enc, max_new_tokens=256, do_sample=False, eos_token_id=tok.eos_token_id, pad_token_id=tok.pad_token_id)
         text = tok.decode(out[0], skip_special_tokens=True)
         pred = parse_final_answer(text) or ""
-        # normalize numbers in GSM8K (strip final explanation after final answer)
         gold_nums = re.findall(r"[-+]?\d[\d,\.]*", ans)
         gold = gold_nums[-1] if gold_nums else ans.strip()
         pred_nums = re.findall(r"[-+]?\d[\d,\.]*", pred)
@@ -720,9 +670,10 @@ def evaluate_gsm8k_em(model: AutoModelForCausalLM, tok: AutoTokenizer, n: int = 
     return {"em": correct / max(1, total), "n": total}
 
 def ppo_train(args: Args, sft_dataset: Dataset):
+    # ---- FIX: build once, do not call with extra positional args ----
     policy, tok = build_ppo_policy_with_lora(args)
-    policy = build_ppo_policy_with_lora(args, tok)
     ref_model = None if args.ref_free else create_reference_model(policy)
+    # -----------------------------------------------------------------
 
     prm = VersaPRM(args.reward_model_id, device=args.device)
 
@@ -739,7 +690,6 @@ def ppo_train(args: Args, sft_dataset: Dataset):
 
     trainer = PPOTrainer(config=cfg, model=policy, ref_model=ref_model, tokenizer=tok)
 
-    # graceful stop + JSONL
     os.makedirs(args.output_dir, exist_ok=True)
     jsonl_path = os.path.join(args.output_dir, args.jsonl_log)
     def log_jsonl(rec: Dict[str, Any]):
@@ -779,7 +729,6 @@ def ppo_train(args: Args, sft_dataset: Dataset):
         if stop_flag["stop"]:
             break
 
-        # KL anneal (if available, set trainer.kl_ctl.target dynamically)
         new_target = anneal_target_kl(args.kl_anneal, epoch, args.ppo_epochs, args.kl_min, args.kl_max)
         try:
             if hasattr(trainer, "kl_ctl") and hasattr(trainer.kl_ctl, "target"):
@@ -794,7 +743,6 @@ def ppo_train(args: Args, sft_dataset: Dataset):
             batch_prompts = prompts[i : i + bs]
             enc = tok(batch_prompts, return_tensors="pt", padding=True).to(args.device)
             attn = enc["attention_mask"]
-            padded_len = enc["input_ids"].shape[1]
 
             num_samples = max(1, args.reward_samples)
             last_query_tensors, last_response_tensors = None, None
@@ -819,28 +767,23 @@ def ppo_train(args: Args, sft_dataset: Dataset):
                     dec_text = tok.decode(full, skip_special_tokens=False)
                     decoded_texts.append(dec_text)
 
-                # Score each prompt
                 for j, text in enumerate(decoded_texts):
                     think = extract_think(text)
                     prm_score = prm.score(batch_prompts[j], think)
                     rule_score = rule_safety_reward(batch_prompts[j], text)
                     total = args.reward_w_prm * prm_score + args.reward_w_rule * rule_score
-                    # clip if desired
                     total = max(args.reward_clip_min, min(args.reward_clip_max, total))
                     rewards_accum[j].append(float(total))
-                    dec_texts_cache[j] = text  # keep last
+                    dec_texts_cache[j] = text
 
                 last_query_tensors = query_tensors
                 last_response_tensors = response_tensors
 
-            # mean over samples per prompt
             final_rewards = [float(np.mean(rs)) if len(rs) > 0 else 0.0 for rs in rewards_accum]
 
-            # PPO step
             stats = trainer.step(last_query_tensors, last_response_tensors, final_rewards)
             global_step += 1
 
-            # logging
             log_jsonl({
                 "epoch": epoch,
                 "global_step": global_step,
@@ -855,29 +798,24 @@ def ppo_train(args: Args, sft_dataset: Dataset):
                 "loss/value": float(stats.get("loss/value", 0.0)) if isinstance(stats.get("loss/value", 0.0), (int,float)) else 0.0,
             })
 
-            # periodic eval (optional)
             if args.eval_every and (global_step % args.eval_every == 0):
                 try:
                     eval_res = evaluate_gsm8k_em(policy.pretrained_model, tok, n=args.eval_gsm8k_n, device=args.device)
                 except Exception:
-                    # if model is wrapped, fall back to full policy
                     eval_res = evaluate_gsm8k_em(policy, tok, n=args.eval_gsm8k_n, device=args.device)
                 log_jsonl({"eval_step": global_step, "gsm8k_em": eval_res.get("em"), "gsm8k_n": eval_res.get("n")})
                 print(f"[EVAL] step {global_step}: GSM8K EM={eval_res.get('em')} on n={eval_res.get('n')}")
 
         print(f"[PPO] finished epoch {epoch+1}/{args.ppo_epochs} (KL target now {new_target:.3f})")
 
-    # Save PPO LoRA adapters
     os.makedirs(args.ppo_lora_dir, exist_ok=True)
     if isinstance(policy.pretrained_model, PeftModel):
         policy.pretrained_model.save_pretrained(args.ppo_lora_dir)
     tok.save_pretrained(args.ppo_lora_dir)
 
-    # Save PPO policy wrapper too (resume PPO)
     final_dir = os.path.join(args.output_dir, "ppo_final_policy")
     trainer.save_pretrained(final_dir)
 
-    # Push adapters if asked
     if args.hf_repo:
         api = HfApi(token=args.hf_token)
         api.create_repo(args.hf_repo, exist_ok=True)
@@ -969,12 +907,10 @@ def main(argv: List[str]):
     else:
         print("[INFO] Skipping SFT; expecting existing adapters in --lora-ckpt-dir")
 
-    # PPO dataset
     ds = build_sft_dataset(args)
     n = min(128000, len(ds))
     rl_ds = ds.shuffle(seed=args.seed).select(range(n))
 
-    # PPO on LoRA adapters (with extras)
     ppo_train(args, rl_ds)
     write_manifest(args, stage="post_ppo", extra={"ppo_lora_dir": args.ppo_lora_dir})
 

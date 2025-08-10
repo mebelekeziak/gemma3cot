@@ -61,10 +61,10 @@ class Args:
     output_dir: str = "./runs/gemma3_cot"
 
     # LoRA (SFT)
-    lora_r: int = 16
+    lora_r: int = 32
     lora_alpha: int = 32
     lora_dropout: float = 0.05
-    target_modules: Tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj")
+    target_modules: Tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
 
     # SFT
     max_seq_len: int = 2048

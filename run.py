@@ -743,9 +743,8 @@ def ppo_train(args: Args, sft_dataset: Dataset):
         base_model_id=args.prm_base_id,
     )
 
-
+    # -------- FIX HERE: remove `model_name` from PPOConfig ----------
     cfg = PPOConfig(
-        model_name="gemma3_cot_ppo_on_lora",
         learning_rate=args.ppo_lr,
         batch_size=args.ppo_batch_size,
         mini_batch_size=args.ppo_mini_bs,
@@ -754,6 +753,7 @@ def ppo_train(args: Args, sft_dataset: Dataset):
         ppo_epochs=args.ppo_epochs,
         entropy_beta=args.entropy_beta,
     )
+    # ---------------------------------------------------------------
 
     trainer = PPOTrainer(config=cfg, model=policy, ref_model=ref_model, tokenizer=tok)
 

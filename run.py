@@ -736,7 +736,13 @@ def ppo_train(args: Args, sft_dataset: Dataset):
     ref_model = None if args.ref_free else create_reference_model(policy)
     # -----------------------------------------------------------------
 
-    prm = VersaPRM(args.reward_model_id, device=args.device)
+    prm = VersaPRM(
+        args.reward_model_id,
+        device=args.device,
+        load_in_4bit=args.prm_load_in_4bit,
+        base_model_id=args.prm_base_id,
+    )
+
 
     cfg = PPOConfig(
         model_name="gemma3_cot_ppo_on_lora",

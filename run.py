@@ -66,6 +66,10 @@ class Args:
     lora_dropout: float = 0.05
     target_modules: Tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
 
+    # PRM loader options
+    prm_load_in_4bit: bool = True    # set False if you want full-fp16 PRM
+    prm_base_id: Optional[str] = os.environ.get("PRM_BASE_ID")  # e.g. "Qwen/Qwen2.5-3B"
+
     # SFT
     max_seq_len: int = 2048
     sft_epochs: int = 1
@@ -127,7 +131,9 @@ class Args:
 def parse_args(argv: List[str]) -> Args:
     import argparse
     p = argparse.ArgumentParser(description="Gemma-3 CoT SFT + PPO on LoRA with KL anneal, entropy, eval, mixed rewards")
-
+    p.add_argument("--prm-base-id", type=str, default=None)
+    p.add_argument("--prm-load-in-4bit", action="store_true", default=None)
+    p.add_argument("--no-prm-load-in-4bit", dest="prm_load_in_4bit", action="store_false")
     # Toggles
     p.add_argument("--run-sft", action="store_true", default=None)
     p.add_argument("--no-run-sft", dest="run_sft", action="store_false")
@@ -324,6 +330,13 @@ def prepare_tokenizer(path_or_id: str, left_pad: bool = False) -> AutoTokenizer:
     return tok
 
 # ======================= Collator & packing =======================
+def _safe_autodtype_for_reward() -> torch.dtype:
+    # T4 (sm_75) has no BF16; use FP16 to avoid slow FP32 + memory blowups
+    if torch.cuda.is_available():
+        major, _ = torch.cuda.get_device_capability()
+        return torch.bfloat16 if major >= 8 else torch.float16
+    return torch.float32
+
 
 def make_sft_collator(tokenizer: AutoTokenizer, max_len: int):
     def collate(batch):
@@ -434,10 +447,10 @@ class VersaPRM:
     """
     VersaPRM scoring:
       - After each reasoning step, the PRM expects a label token ('CORRECT' / 'INCORRECT').
-      - We build: input = question + " \\n\\n" + (" \\n\\n\\n\\n".join(steps)) + " \\n\\n\\n\\n"
-      - We find every occurrence of the full delimiter " \\n\\n\\n\\n" in the tokenized input,
-        and at the index of its final token we read the NEXT-token distribution (logits[t])
-        and softmax over the two label tokens to get P(CORRECT). We then average across steps.
+      - We build: input = question + " \n\n" + (" \n\n\n\n".join(steps)) + " \n\n\n\n"
+      - We find every occurrence of the full delimiter " \n\n\n\n" in the tokenized input,
+        and at the index of its final token we read the NEXT-token distribution and compute P(CORRECT),
+        averaging across steps.
     """
     def __init__(
         self,
@@ -446,7 +459,14 @@ class VersaPRM:
         correct_label_candidates=(" CORRECT", " Correct", " correct", " YES", " Yes", " yes", " True", " true"),
         incorrect_label_candidates=(" INCORRECT", " Incorrect", " incorrect", " NO", " No", " no", " False", " false"),
         step_delim: str = " \n\n\n\n",
+        # new knobs (threaded through via Args)
+        load_in_4bit: Optional[bool] = None,
+        base_model_id: Optional[str] = None,
     ):
+        # Decide dtype compatible with T4 etc.
+        prm_dtype = _safe_autodtype_for_reward()
+
+        # Tokenizer
         self.tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
         if self.tok.eos_token is None:
             if self.tok.sep_token is not None:
@@ -458,17 +478,54 @@ class VersaPRM:
         self.tok.padding_side = "left"
         self.tok.truncation_side = "left"
 
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            low_cpu_mem_usage=True,
-        )
+        # BitsAndBytes config (optional 4-bit)
+        quant_cfg = None
+        if load_in_4bit:
+            quant_cfg = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=prm_dtype,
+            )
+
+        # Two loading paths:
+        # A) Adapter repo (recommended): provide base_model_id -> load base, then attach adapter
+        # B) Full model repo: load directly
+        if base_model_id:
+            # Load base
+            base_kwargs: Dict[str, Any] = dict(
+                torch_dtype=prm_dtype,
+                device_map="auto",
+                low_cpu_mem_usage=True,
+            )
+            if quant_cfg is not None:
+                base_kwargs["quantization_config"] = quant_cfg
+
+            base = AutoModelForCausalLM.from_pretrained(base_model_id, **base_kwargs)
+
+            # Attach adapter (no .to() calls; keep accelerate hooks)
+            self.model = PeftModel.from_pretrained(
+                base,
+                model_id,
+                is_trainable=False,
+            )
+        else:
+            # Try to load as a full model
+            full_kwargs: Dict[str, Any] = dict(
+                torch_dtype=prm_dtype,
+                device_map="auto",
+                low_cpu_mem_usage=True,
+            )
+            if quant_cfg is not None:
+                full_kwargs["quantization_config"] = quant_cfg
+
+            self.model = AutoModelForCausalLM.from_pretrained(model_id, **full_kwargs)
+
         self.model.eval()
 
+        # Scoring config
         self.step_delim = step_delim
         self.step_ids = self.tok.encode(self.step_delim, add_special_tokens=False)
-
         self.candidate_ids = self._resolve_candidate_ids(
             correct_label_candidates, incorrect_label_candidates
         )  # order: [INCORRECT, CORRECT]
@@ -512,14 +569,18 @@ class VersaPRM:
             return 0.0
         joined = self.step_delim.join(raw_lines) + self.step_delim
         input_text = (question or "").strip() + " \n\n" + joined
+
+        # Stay on whatever devices Accelerate assigned
         device = next(self.model.parameters()).device
         ids = self.tok.encode(input_text, add_special_tokens=False)
         input_ids = torch.tensor([ids], device=device)
+
         out = self.model(input_ids)
         cand_logits = torch.stack(
             [out.logits[:, :, cid] for cid in self.candidate_ids], dim=-1
         )
         probs = torch.softmax(cand_logits, dim=-1)[0]
+
         pos_idx = self._find_delim_tail_positions(input_ids[0])
         if not pos_idx:
             tail_len = min(64, probs.shape[0])

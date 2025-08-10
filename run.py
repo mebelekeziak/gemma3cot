@@ -743,17 +743,16 @@ def ppo_train(args: Args, sft_dataset: Dataset):
         base_model_id=args.prm_base_id,
     )
 
-    # -------- FIX HERE: remove `model_name` from PPOConfig ----------
+    # -------- FIX HERE: drop unsupported PPOConfig arg ----------
     cfg = PPOConfig(
         learning_rate=args.ppo_lr,
         batch_size=args.ppo_batch_size,
         mini_batch_size=args.ppo_mini_bs,
-        adaptive_kl_ctrl=True,
         target_kl=args.ppo_target_kl,
         ppo_epochs=args.ppo_epochs,
         entropy_beta=args.entropy_beta,
     )
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------
 
     trainer = PPOTrainer(config=cfg, model=policy, ref_model=ref_model, tokenizer=tok)
 

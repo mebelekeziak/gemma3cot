@@ -611,54 +611,64 @@ def _bf16_supported() -> bool:
     major, _ = torch.cuda.get_device_capability()
     return major >= 8  # Ampere+ supports BF16
 
-def build_ppo_policy_with_lora(args: Args, tokenizer: AutoTokenizer) -> AutoModelForCausalLMWithValueHead:
-    """
-    Load base (optionally 4-bit), attach value head, then load SFT LoRA adapters.
-    Freeze base; train LoRA + v_head only.
-    NOTE: Use BitsAndBytesConfig when quantizing; do NOT pass bnb_4bit_* directly.
-    """
+def build_ppo_policy_with_lora(args: Args) -> Tuple[AutoModelForCausalLMWithValueHead, AutoTokenizer]:
     use_bf16 = _bf16_supported()
     dtype = torch.bfloat16 if use_bf16 else torch.float32
+
+    # Always use the tokenizer saved alongside the SFT LoRA (has the extra tokens)
+    tok = AutoTokenizer.from_pretrained(args.lora_ckpt_dir, use_fast=True)
+    if tok.eos_token is None:
+        if tok.sep_token is not None:
+            tok.eos_token = tok.sep_token
+        else:
+            tok.add_special_tokens({"eos_token": "</s>"})
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    tok.padding_side = "left"
+    tok.truncation_side = "left"
 
     model_kwargs: Dict[str, Any] = dict(
         torch_dtype=dtype,
         device_map="auto",
         low_cpu_mem_usage=True,
     )
-
     if args.load_in_4bit:
-        bnb_config = BitsAndBytesConfig(
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_compute_dtype=(torch.bfloat16 if use_bf16 else torch.float32),
             bnb_4bit_quant_type="nf4",
         )
-        model_kwargs["quantization_config"] = bnb_config
 
-    model = AutoModelForCausalLMWithValueHead.from_pretrained(
+    policy = AutoModelForCausalLMWithValueHead.from_pretrained(
         args.base_model_id,
         **model_kwargs,
     )
 
-    model.pretrained_model = PeftModel.from_pretrained(
-        model.pretrained_model,
+    # 🔧 Make base vocab match the SFT tokenizer BEFORE loading LoRA
+    new_vocab = len(tok)
+    base_vocab = policy.pretrained_model.get_input_embeddings().weight.shape[0]
+    if new_vocab != base_vocab:
+        policy.pretrained_model.resize_token_embeddings(new_vocab)
+
+    # Load LoRA adapters (now shapes line up)
+    policy.pretrained_model = PeftModel.from_pretrained(
+        policy.pretrained_model,
         args.lora_ckpt_dir,
         is_trainable=True,
     )
 
-    # Freeze all, then unfreeze LoRA + v_head
-    for n, p in model.named_parameters():
+    # Freeze base, train LoRA + value head only
+    for n, p in policy.named_parameters():
         p.requires_grad = False
-    for n, p in model.named_parameters():
+    for n, p in policy.named_parameters():
         if "lora_" in n or n.startswith("v_head"):
             p.requires_grad = True
 
-    if tokenizer.pad_token_id is not None:
-        model.config.pad_token_id = tokenizer.pad_token_id
-    if tokenizer.eos_token_id is not None:
-        model.config.eos_token_id = tokenizer.eos_token_id
+    policy.config.pad_token_id = tok.pad_token_id
+    policy.config.eos_token_id = tok.eos_token_id
+    return policy, tok
 
-    return model
 
 def anneal_target_kl(kind: str, epoch_idx: int, total_epochs: int, kl_min: float, kl_max: float) -> float:
     if kind == "none" or total_epochs <= 1:
@@ -710,7 +720,7 @@ def evaluate_gsm8k_em(model: AutoModelForCausalLM, tok: AutoTokenizer, n: int = 
     return {"em": correct / max(1, total), "n": total}
 
 def ppo_train(args: Args, sft_dataset: Dataset):
-    tok = prepare_tokenizer(args.base_model_id, left_pad=True)
+    policy, tok = build_ppo_policy_with_lora(args)
     policy = build_ppo_policy_with_lora(args, tok)
     ref_model = None if args.ref_free else create_reference_model(policy)
 

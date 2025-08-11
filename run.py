@@ -1,5 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+import os
+os.environ["TORCH_COMPILE_DISABLE"] = "1"     # PyTorch 2.5+
+os.environ["TORCHDYNAMO_DISABLE"] = "1"       # legacy switch many libs respect
+os.environ["ACCELERATE_USE_DYNAMO"] = "0"     # in case accelerate/TRL tries to enable it
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"      # quiet TF/XLA spam; harmless
 import os, re, json, time, signal, warnings, random, subprocess, sys
 from dataclasses import dataclass, asdict
 from typing import List, Tuple, Dict, Any, Optional

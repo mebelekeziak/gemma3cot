@@ -1193,6 +1193,22 @@ def ppo_train(args: Args, sft_dataset: Dataset, pc: PrecisionCfg):
         reward_model=rm
     )
 
+    m = getattr(trainer, "model", None)
+    if m is not None and not hasattr(m, "generate"):
+        # TRL's wrapper usually exposes .policy_model (or .actor_model) which *does* have .generate
+        policy_like = getattr(m, "policy_model", None) or getattr(m, "actor_model", None)
+        if policy_like is not None and hasattr(policy_like, "generate"):
+            def _delegate_generate(*args, _m=m, **kwargs):
+                tgt = getattr(_m, "policy_model", None) or getattr(_m, "actor_model", None)
+                return tgt.generate(*args, **kwargs)
+            setattr(m, "generate", _delegate_generate)
+
+            # be nice and mirror gen/config too so any other utils don't choke
+            if not hasattr(m, "generation_config") and hasattr(policy_like, "generation_config"):
+                m.generation_config = policy_like.generation_config
+            if not hasattr(m, "config") and hasattr(policy_like, "config"):
+                m.config = policy_like.config
+            
     trainer.train()
 
     os.makedirs(args.ppo_lora_dir, exist_ok=True)

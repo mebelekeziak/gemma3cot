@@ -909,8 +909,13 @@ def rule_safety_reward(prompt: str, output: str) -> float:
 # ======================= PPO (LoRA-only training) =======================
 
 def build_ppo_policy_with_lora(args: Args, pc: PrecisionCfg) -> Tuple[AutoModelForCausalLMWithValueHead, AutoTokenizer]:
-    compute_dtype = _dtype_for_model(args.base_model_id, pc)
+    """
+    Gemma-3 + T4 + Unsloth: keep PPO policy in full fp32.
+    Avoid 4-bit here to prevent Half/Float matmul mismatches inside Unsloth-patched layers.
+    """
+    is_gemma3 = _is_gemma3(args.base_model_id)
 
+    # --- tokenizer (left-pad for generation/RL) ---
     tok = AutoTokenizer.from_pretrained(args.lora_ckpt_dir, use_fast=True)
     if tok.eos_token is None:
         if tok.sep_token is not None:
@@ -922,43 +927,64 @@ def build_ppo_policy_with_lora(args: Args, pc: PrecisionCfg) -> Tuple[AutoModelF
     tok.padding_side = "left"
     tok.truncation_side = "left"
 
+    # --- model load: force fp32 for Gemma-3; NO 4-bit on Gemma-3 ---
+    compute_dtype = _dtype_for_model(args.base_model_id, pc)
     model_kwargs: Dict[str, Any] = dict(
-        torch_dtype=compute_dtype,
+        torch_dtype=torch.float32 if is_gemma3 else compute_dtype,
         device_map="auto",
         low_cpu_mem_usage=True,
     )
-    if args.load_in_4bit:
+
+    # Only allow 4-bit on non-Gemma-3 models
+    if (not is_gemma3) and args.load_in_4bit:
         model_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=pc.bnb_compute_dtype,
             bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=pc.bnb_compute_dtype,  # bf16 on Ampere+, fp16 on pre-Ampere
         )
 
     policy = AutoModelForCausalLMWithValueHead.from_pretrained(
         args.base_model_id,
         **model_kwargs,
     )
-    _fix_trl_valuehead_base_prefix(policy)
+
+    # Make sure vocab matches LoRA tokenizer size
     new_vocab = len(tok)
     base_vocab = policy.pretrained_model.get_input_embeddings().weight.shape[0]
     if new_vocab != base_vocab:
         policy.pretrained_model.resize_token_embeddings(new_vocab)
 
+    # --- attach LoRA adapters (trainable) ---
     policy.pretrained_model = PeftModel.from_pretrained(
         policy.pretrained_model,
         args.lora_ckpt_dir,
         is_trainable=True,
     )
 
+    # === CRITICAL: align dtypes to avoid Half/Float matmul ===
+    if is_gemma3:
+        # unify everything to fp32 (backbone + LoRA + v_head)
+        policy.pretrained_model.to(dtype=torch.float32)
+        policy.v_head.to(dtype=torch.float32)
+        # also ensure module.config has correct ids
+        policy.config.pad_token_id = tok.pad_token_id
+        policy.config.eos_token_id = tok.eos_token_id
+
+    # freeze all, then unfreeze LoRA and v_head
     for n, p in policy.named_parameters():
         p.requires_grad = False
     for n, p in policy.named_parameters():
         if "lora_" in n or n.startswith("v_head"):
             p.requires_grad = True
 
+    # generation ids set
     policy.config.pad_token_id = tok.pad_token_id
     policy.config.eos_token_id = tok.eos_token_id
+
+    # keep TRL >=0.21 happy
+    _fix_trl_valuehead_base_prefix(policy)
+
     return policy, tok
 
 

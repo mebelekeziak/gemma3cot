@@ -1,6 +1,12 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+# kill TF/XLA spam (optional)
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
+# make unsloth stop meddling with generate/compile and force fp32 for Gemma 3
+os.environ["UNSLOTH_DISABLE_FAST_GENERATION"] = "1"
+os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
+os.environ["UNSLOTH_FORCE_FLOAT32"] = "1"
 import os, re, json, time, signal, warnings, random, subprocess, sys
 from dataclasses import dataclass, asdict
 from typing import List, Tuple, Dict, Any, Optional
@@ -907,6 +913,9 @@ def rule_safety_reward(prompt: str, output: str) -> float:
     return float(max(-1.0, min(1.0, score)))
 
 # ======================= PPO (LoRA-only training) =======================
+from importlib import reload
+import transformers.models.gemma3.modeling_gemma3 as _gemma3
+reload(_gemma3)
 
 def build_ppo_policy_with_lora(args: Args, pc: PrecisionCfg) -> Tuple[AutoModelForCausalLMWithValueHead, AutoTokenizer]:
     """
@@ -962,7 +971,6 @@ def build_ppo_policy_with_lora(args: Args, pc: PrecisionCfg) -> Tuple[AutoModelF
         is_trainable=True,
     )
 
-    # === CRITICAL: align dtypes to avoid Half/Float matmul ===
     if is_gemma3:
         # unify everything to fp32 (backbone + LoRA + v_head)
         policy.pretrained_model.to(dtype=torch.float32)
@@ -970,6 +978,20 @@ def build_ppo_policy_with_lora(args: Args, pc: PrecisionCfg) -> Tuple[AutoModelF
         # also ensure module.config has correct ids
         policy.config.pad_token_id = tok.pad_token_id
         policy.config.eos_token_id = tok.eos_token_id
+
+        # extra guard: upcast any stray fp16 activations to match weight dtype
+        import torch.nn as nn
+        def _force_linear_input_dtype(module: nn.Module):
+            for m in module.modules():
+                if isinstance(m, nn.Linear):
+                    old_fwd = m.forward
+                    def new_fwd(x, *args, _old=old_fwd, _m=m, **kw):
+                        if hasattr(_m, "weight") and x.dtype != _m.weight.dtype:
+                            x = x.to(_m.weight.dtype)
+                        return _old(x, *args, **kw)
+                    m.forward = new_fwd
+        _force_linear_input_dtype(policy.pretrained_model)
+
 
     # freeze all, then unfreeze LoRA and v_head
     for n, p in policy.named_parameters():
@@ -986,6 +1008,7 @@ def build_ppo_policy_with_lora(args: Args, pc: PrecisionCfg) -> Tuple[AutoModelF
     _fix_trl_valuehead_base_prefix(policy)
 
     return policy, tok
+
 
 
 def anneal_target_kl(kind: str, epoch_idx: int, total_epochs: int, kl_min: float, kl_max: float) -> float:

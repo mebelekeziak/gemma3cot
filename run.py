@@ -30,6 +30,40 @@ from peft import PeftModel
 warnings.filterwarnings("ignore", category=UserWarning)
 
 
+from transformers import GenerationConfig
+
+def ensure_generation_config(model, tok):
+    """
+    Make sure the TRL value-head wrapper exposes a .generation_config,
+    and that it has eos/pad ids set.
+    Also mirrors onto the underlying backbone for safety.
+    """
+    gen_cfg = getattr(model, "generation_config", None)
+    if gen_cfg is None:
+        base = getattr(model, "pretrained_model", None)
+        if base is not None and hasattr(base, "generation_config") and base.generation_config is not None:
+            gen_cfg = base.generation_config
+        else:
+            gen_cfg = GenerationConfig.from_model_config(model.config)
+        setattr(model, "generation_config", gen_cfg)
+
+    # ensure token ids are set everywhere
+    if getattr(gen_cfg, "eos_token_id", None) is None:
+        gen_cfg.eos_token_id = tok.eos_token_id
+    if getattr(gen_cfg, "pad_token_id", None) is None:
+        gen_cfg.pad_token_id = tok.pad_token_id
+
+    # mirror to backbone + configs too (some code paths read from there)
+    base = getattr(model, "pretrained_model", None)
+    if base is not None:
+        base.generation_config = gen_cfg
+        base.config.eos_token_id = tok.eos_token_id
+        base.config.pad_token_id = tok.pad_token_id
+    model.config.eos_token_id = tok.eos_token_id
+    model.config.pad_token_id = tok.pad_token_id
+
+
+
 import inspect
 
 # REPLACE make_ppo_trainer with this versioned switch:
@@ -849,7 +883,7 @@ def evaluate_gsm8k_em(model: AutoModelForCausalLM, tok: AutoTokenizer, n: int = 
 def ppo_train(args: Args, sft_dataset: Dataset, pc: PrecisionCfg):
     policy, tok = build_ppo_policy_with_lora(args, pc)
     ref_model = None if args.ref_free else create_reference_model(policy)
-
+    ensure_generation_config(policy, tok)
     prm = VersaPRM(
         args.reward_model_id,
         device=args.device,

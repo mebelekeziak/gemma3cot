@@ -4,6 +4,9 @@
 import os, re, json, time, signal, warnings, random, subprocess, sys
 from dataclasses import dataclass, asdict
 from typing import List, Tuple, Dict, Any, Optional
+# ADD near your imports:
+from packaging.version import parse as V
+import trl as trl_lib
 
 import numpy as np
 import torch
@@ -29,52 +32,41 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 import inspect
 
+# REPLACE make_ppo_trainer with this versioned switch:
 def make_ppo_trainer(cfg, policy, ref_model, tok, train_dataset, data_collator=None):
-    import inspect
-    sig = inspect.signature(PPOTrainer.__init__)
-    names = set(sig.parameters.keys())
-
-    base = {"model": policy}
-    if "ref_model" in names:
-        base["ref_model"] = ref_model
-    if "reward_model" in names:
-        base["reward_model"] = None
-    if "value_model" in names:
-        base["value_model"] = None
-    if "data_collator" in names and data_collator is not None:
-        base["data_collator"] = data_collator
-
-    ds_key = "train_dataset" if "train_dataset" in names else ("dataset" if "dataset" in names else None)
-    if ds_key:
-        base[ds_key] = train_dataset
-
-    attempts = []
-    attempts.append({**base, "ppo_config": cfg})
-    attempts.append({**base, "config": cfg})
-
-    last_err = None
-    for kw in attempts:
-        # try with tokenizer if accepted
-        if "tokenizer" in names:
-            try:
-                return PPOTrainer(**{**kw, "tokenizer": tok})
-            except TypeError as e:
-                last_err = e
-        # try without tokenizer
-        try:
-            return PPOTrainer(**kw)
-        except TypeError as e:
-            last_err = e
-
-    # final positional fallbacks
+    new_api = False
     try:
-        return PPOTrainer(cfg, policy, ref_model)
-    except TypeError:
-        pass
-    try:
-        return PPOTrainer(cfg, model=policy, ref_model=ref_model)
-    except TypeError as e:
-        raise last_err if last_err is not None else e
+        new_api = V(trl_lib.__version__) >= V("0.12.0")
+    except Exception:
+        new_api = True  # safest default
+
+    common = {}
+    if data_collator is not None:
+        common["data_collator"] = data_collator
+
+    if new_api:
+        # TRL >= 0.12 expects ppo_config + train_dataset
+        return PPOTrainer(
+            model=policy,
+            ref_model=ref_model,
+            tokenizer=tok,
+            reward_model=None,
+            value_model=None,
+            ppo_config=cfg,
+            train_dataset=train_dataset,
+            **common,
+        )
+    else:
+        # Older TRL expects config + dataset
+        return PPOTrainer(
+            config=cfg,
+            model=policy,
+            ref_model=ref_model,
+            tokenizer=tok,
+            dataset=train_dataset,
+            **common,
+        )
+
 # ======================= Utilities =======================
 
 def get_git_commit() -> Optional[str]:

@@ -463,12 +463,17 @@ def sft_train(args: Args, pc: PrecisionCfg) -> str:
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    dtype_for_unsloth = _dtype_for_model(args.base_model_id, pc)
+    # IMPORTANT:
+    # unsloth disallows dtype=torch.float32. On pre-Ampere with Gemma-3 our precision chooser
+    # will select fp32; in that case we hand unsloth dtype=None so it can choose internally,
+    # while we still quantize to 4-bit with fp16 compute.
+    desired_dtype = _dtype_for_model(args.base_model_id, pc)
+    dtype_for_unsloth: Optional[torch.dtype] = None if desired_dtype == torch.float32 else desired_dtype
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.base_model_id,
         max_seq_length=args.max_seq_len,
-        dtype=dtype_for_unsloth,
+        dtype=dtype_for_unsloth,      # None on T4+Gemma3 to avoid AssertionError
         load_in_4bit=args.load_in_4bit,
     )
     tokenizer.add_special_tokens({"additional_special_tokens": ["<think>", "</think>"]})

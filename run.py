@@ -30,41 +30,51 @@ warnings.filterwarnings("ignore", category=UserWarning)
 import inspect
 
 def make_ppo_trainer(cfg, policy, ref_model, tok, train_dataset, data_collator=None):
-    """
-    Handle TRL API changes:
-      - some versions want ppo_config vs config
-      - some require train_dataset (or dataset)
-      - some expose reward_model/value_model args (we pass None)
-      - some accept tokenizer and some don't
-    """
+    import inspect
     sig = inspect.signature(PPOTrainer.__init__)
-    params = sig.parameters
+    names = set(sig.parameters.keys())
 
-    kwargs = {"model": policy}
+    base = {"model": policy}
+    if "ref_model" in names:
+        base["ref_model"] = ref_model
+    if "reward_model" in names:
+        base["reward_model"] = None
+    if "value_model" in names:
+        base["value_model"] = None
+    if "data_collator" in names and data_collator is not None:
+        base["data_collator"] = data_collator
 
-    # config kw
-    if "ppo_config" in params:
-        kwargs["ppo_config"] = cfg
-    else:
-        kwargs["config"] = cfg
+    ds_key = "train_dataset" if "train_dataset" in names else ("dataset" if "dataset" in names else None)
+    if ds_key:
+        base[ds_key] = train_dataset
 
-    # optional/variant args
-    if "ref_model" in params:
-        kwargs["ref_model"] = ref_model
-    if "train_dataset" in params:
-        kwargs["train_dataset"] = train_dataset
-    elif "dataset" in params:
-        kwargs["dataset"] = train_dataset
-    if data_collator is not None and "data_collator" in params:
-        kwargs["data_collator"] = data_collator
-    if "reward_model" in params:
-        kwargs["reward_model"] = None
-    if "value_model" in params:
-        kwargs["value_model"] = None
-    if "tokenizer" in params:
-        kwargs["tokenizer"] = tok
+    attempts = []
+    attempts.append({**base, "ppo_config": cfg})
+    attempts.append({**base, "config": cfg})
 
-    return PPOTrainer(**kwargs)
+    last_err = None
+    for kw in attempts:
+        # try with tokenizer if accepted
+        if "tokenizer" in names:
+            try:
+                return PPOTrainer(**{**kw, "tokenizer": tok})
+            except TypeError as e:
+                last_err = e
+        # try without tokenizer
+        try:
+            return PPOTrainer(**kw)
+        except TypeError as e:
+            last_err = e
+
+    # final positional fallbacks
+    try:
+        return PPOTrainer(cfg, policy, ref_model)
+    except TypeError:
+        pass
+    try:
+        return PPOTrainer(cfg, model=policy, ref_model=ref_model)
+    except TypeError as e:
+        raise last_err if last_err is not None else e
 # ======================= Utilities =======================
 
 def get_git_commit() -> Optional[str]:

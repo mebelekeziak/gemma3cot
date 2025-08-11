@@ -100,81 +100,112 @@ def ensure_generation_config(model, tok):
 
 import inspect
 
-# REPLACE make_ppo_trainer with this versioned switch:
-# drop-in replacement
+# === FIXED: version-flexible, positional-safe constructor ===
 def make_ppo_trainer(cfg, policy, ref_model, tok, train_dataset, data_collator=None):
     """
     Version-flexible PPOTrainer constructor.
-    - TRL <= 0.11: PPOTrainer(config|args, model, ref_model, tokenizer=...)
-    - TRL 0.12–0.20: keyworded config/model/ref_model/... variants
-    - TRL >= 0.21: PPOTrainer(ppo_config=..., policy_model=..., value_model=..., reward_model=..., ref_policy_model=..., processing_class=...)
+    Handles:
+      - TRL <= 0.11: PPOTrainer(config|args, model, ref_model, tokenizer=...)
+      - TRL 0.12–0.20: keyworded config/model/ref_model/... variants
+      - TRL >= 0.21: may require POSitional-only (policy_model, value_model, ...) args
+    We introspect the signature and:
+      * supply positional-only args in-order via *args
+      * pass the rest via **kwargs
+      * fallback to older minimal API if needed
     """
-    import inspect
-
-    # actor/critic resolution
+    # resolve actor/critic
     actor = getattr(policy, "pretrained_model", None) or getattr(policy, "model", None) or policy
     critic = policy  # AutoModelForCausalLMWithValueHead wrapper
 
-    # make sure generation_config present everywhere
     ensure_generation_config(critic, tok)
     if actor is not critic:
         ensure_generation_config(actor, tok)
 
+    # canonical value resolver
+    def value_for(name: str):
+        # normalize a few alias sets
+        if name in ("ppo_config", "config", "args"):
+            return cfg
+        if name in ("policy_model", "actor_model"):
+            return actor
+        if name in ("value_model", "critic_model"):
+            return critic
+        if name in ("model",):
+            # old API single-arg "model" expects value-head wrapper
+            return critic
+        if name in ("ref_model", "reference_model"):
+            return ref_model
+        if name in ("ref_policy_model",):
+            return getattr(ref_model, "pretrained_model", ref_model) if ref_model is not None else None
+        if name in ("processing_class", "tokenizer"):
+            return tok
+        if name in ("train_dataset", "dataset"):
+            return train_dataset
+        if name in ("data_collator",):
+            return data_collator
+        if name in ("reward_model",):
+            return NoopRewardModel()
+        return None
+
     sig = inspect.signature(PPOTrainer.__init__)
-    names = list(sig.parameters.keys())
+    params = list(sig.parameters.values())[1:]  # skip self
 
-    kw = {}
+    # Build positional-only args (and optionally required positional-or-keyword without defaults)
+    pos_args = []
+    kw_args: Dict[str, Any] = {}
 
-    # config
-    if "ppo_config" in names:
-        kw["ppo_config"] = cfg
-    elif "config" in names:
-        kw["config"] = cfg
-    elif "args" in names:
-        kw["args"] = cfg
+    for p in params:
+        # if it's positional-only, we MUST pass by position
+        if p.kind == inspect.Parameter.POSITIONAL_ONLY:
+            val = value_for(p.name)
+            if val is None and p.default is inspect._empty:
+                # try a couple of sensible fallbacks based on common orders
+                if p.name.lower().startswith("policy"):
+                    val = actor
+                elif p.name.lower().startswith("value"):
+                    val = critic
+                elif p.name.lower().startswith("ref"):
+                    val = getattr(ref_model, "pretrained_model", ref_model) if ref_model is not None else None
+                elif "config" in p.name:
+                    val = cfg
+            pos_args.append(val)
+        else:
+            # try to give by keyword if we have a value
+            val = value_for(p.name)
+            if val is not None:
+                kw_args[p.name] = val
 
-    # dataset
-    if "train_dataset" in names:
-        kw["train_dataset"] = train_dataset
-    elif "dataset" in names:
-        kw["dataset"] = train_dataset
+    # If nothing positional-only was detected but we still might be on a newer TRL that
+    # made these required POSITIONAL_OR_KEYWORD without defaults, ensure we include them.
+    required_names = {p.name for p in params if (p.default is inspect._empty and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY))}
+    for rn in required_names:
+        if rn not in kw_args:
+            val = value_for(rn)
+            if val is not None:
+                kw_args[rn] = val
 
-    # tokenizer / processing
-    if "processing_class" in names:
-        kw["processing_class"] = tok
-    elif "tokenizer" in names:
-        kw["tokenizer"] = tok
+    # Safety: don't pass None for collator if not needed
+    if "data_collator" in kw_args and kw_args["data_collator"] is None:
+        kw_args.pop("data_collator")
 
-    # reference / ref policy naming drift
-    if "ref_model" in names:
-        kw["ref_model"] = ref_model
-    elif "reference_model" in names:
-        kw["reference_model"] = ref_model
-    elif "ref_policy_model" in names:
-        kw["ref_policy_model"] = getattr(ref_model, "pretrained_model", ref_model) if ref_model is not None else None
-
-    # actor/critic (various possible names)
-    if "policy_model" in names and "value_model" in names:
-        kw["policy_model"] = actor
-        kw["value_model"] = critic
-    elif "actor_model" in names and "critic_model" in names:
-        kw["actor_model"] = actor
-        kw["critic_model"] = critic
-    elif "model" in names:
-        # older TRL that expects a single value-head model
-        kw["model"] = critic
-
-    # reward model (newer TRL requires this)
-    if "reward_model" in names:
-        kw["reward_model"] = NoopRewardModel()
-
-    # optional collator
-    if data_collator is not None and "data_collator" in names:
-        kw["data_collator"] = data_collator
-
-    return PPOTrainer(**kw)
-
-
+    # First attempt: as constructed
+    try:
+        return PPOTrainer(*pos_args, **kw_args)
+    except TypeError as e1:
+        # Second attempt: old API variant
+        try:
+            return PPOTrainer(cfg, critic, ref_model, tokenizer=tok, dataset=train_dataset, data_collator=data_collator)
+        except TypeError:
+            # Third attempt: some newer builds may dislike processing_class vs tokenizer
+            kw2 = dict(kw_args)
+            if "processing_class" in kw2:
+                pc = kw2.pop("processing_class")
+                kw2["tokenizer"] = pc
+            try:
+                return PPOTrainer(*pos_args, **kw2)
+            except TypeError as e3:
+                # Final: raise with context
+                raise TypeError(f"PPOTrainer construction failed.\nFirst error: {e1}\nThird error: {e3}\nSignature seen: {sig}\npos_args={ [type(a).__name__ for a in pos_args] }\nkw={ list(kw_args.keys()) }")
 
 
 # ======================= Utilities =======================

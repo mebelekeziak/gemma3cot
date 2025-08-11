@@ -29,6 +29,32 @@ from peft import PeftModel
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
+# --- TRL >= 0.21 compat: give ValueHead wrappers a base_model_prefix ---
+def _fix_trl_valuehead_base_prefix(model):
+    """
+    TRL >= 0.21 does: getattr(value_model, value_model.base_model_prefix)
+    AutoModelForCausalLMWithValueHead lacks base_model_prefix.
+    This sets it to 'pretrained_model' so TRL can reach the backbone.
+    """
+    try:
+        # if it's already set, do nothing
+        getattr(model, "base_model_prefix")
+        return model
+    except AttributeError:
+        pass
+
+    if hasattr(model, "pretrained_model"):
+        # normal path for AutoModelForCausalLMWithValueHead
+        model.base_model_prefix = "pretrained_model"
+    elif hasattr(model, "model"):
+        model.base_model_prefix = "model"
+    elif hasattr(model, "transformer"):
+        model.base_model_prefix = "transformer"
+    else:
+        # last resort: point to self so getattr(...) won't crash
+        model.base_model_prefix = ""
+    return model
+
 
 # ---- Reward model shim for TRL >= 0.21 (and older) ----
 import torch
@@ -913,7 +939,7 @@ def build_ppo_policy_with_lora(args: Args, pc: PrecisionCfg) -> Tuple[AutoModelF
         args.base_model_id,
         **model_kwargs,
     )
-
+    _fix_trl_valuehead_base_prefix(policy)
     new_vocab = len(tok)
     base_vocab = policy.pretrained_model.get_input_embeddings().weight.shape[0]
     if new_vocab != base_vocab:
@@ -985,6 +1011,8 @@ def evaluate_gsm8k_em(model: AutoModelForCausalLM, tok: AutoTokenizer, n: int = 
 def ppo_train(args: Args, sft_dataset: Dataset, pc: PrecisionCfg):
     policy, tok = build_ppo_policy_with_lora(args, pc)
     ref_model = None if args.ref_free else create_reference_model(policy)
+    if ref_model is not None:
+        _fix_trl_valuehead_base_prefix(ref_model)
     ensure_generation_config(policy, tok)
     prm = VersaPRM(
         args.reward_model_id,

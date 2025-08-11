@@ -42,6 +42,87 @@ def set_seed(seed: int) -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
+def _gpu_capability() -> Tuple[int, int]:
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_capability()
+    return (0, 0)
+
+def _is_bf16_supported() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    # PyTorch check + SM >= 80 (Ampere+) is a good proxy
+    try:
+        if hasattr(torch.cuda, "is_bf16_supported"):
+            return bool(torch.cuda.is_bf16_supported())
+    except Exception:
+        pass
+    major, _ = _gpu_capability()
+    return major >= 8
+
+def _is_gemma3(model_id: str) -> bool:
+    return "gemma-3" in (model_id or "").lower()
+
+@dataclass
+class PrecisionCfg:
+    mode: str                 # "auto", "bf16", "fp16", "fp32"
+    model_dtype: torch.dtype  # dtype to load policy/models with
+    bnb_compute_dtype: torch.dtype  # dtype for 4-bit compute
+    trainer_bf16: bool
+    trainer_fp16: bool
+    note: str
+
+def choose_precision(mode: Optional[str], base_model_id: str) -> PrecisionCfg:
+    req = (mode or os.environ.get("PRECISION") or "auto").lower()
+    cuda = torch.cuda.is_available()
+    major, minor = _gpu_capability()
+    bf16_ok = _is_bf16_supported()
+
+    def cfg(model_dtype, bnb_dtype, bf16_flag, fp16_flag, note):
+        return PrecisionCfg(req, model_dtype, bnb_dtype, bf16_flag, fp16_flag, note)
+
+    if req not in {"auto","bf16","fp16","fp32"}:
+        req = "auto"
+
+    if req == "bf16":
+        if not bf16_ok:
+            # fallback: for Gemma-3 we must not use fp16 -> use fp32
+            if _is_gemma3(base_model_id):
+                return cfg(torch.float32, torch.float16, False, False, "forced bf16 but unsupported; Gemma-3 -> fp32")
+            return cfg(torch.float16, torch.float16, False, True, "forced bf16 but unsupported; fallback fp16")
+        return cfg(torch.bfloat16, torch.bfloat16, True, False, "forced bf16")
+
+    if req == "fp16":
+        # Gemma-3 doesn't run correctly in fp16 => force fp32
+        if _is_gemma3(base_model_id):
+            return cfg(torch.float32, torch.float16, False, False, "Gemma-3 forbids fp16 -> using fp32")
+        return cfg(torch.float16, torch.float16, False, True, "forced fp16")
+
+    if req == "fp32":
+        return cfg(torch.float32, torch.float16, False, False, "forced fp32")
+
+    # AUTO
+    if cuda and bf16_ok:
+        # H100/H200/Ampere etc.
+        return cfg(torch.bfloat16, torch.bfloat16, True, False, "auto->bf16 (Ampere/Hopper)")
+    if cuda:
+        # Pre-Ampere like T4. Gemma-3 cannot use fp16 -> fp32
+        if _is_gemma3(base_model_id):
+            return cfg(torch.float32, torch.float16, False, False, "auto on Turing + Gemma-3 -> fp32")
+        return cfg(torch.float16, torch.float16, False, True, "auto on pre-Ampere -> fp16")
+    # CPU
+    return cfg(torch.float32, torch.float16, False, False, "auto on CPU -> fp32")
+
+def _print_precision_banner(pc: PrecisionCfg):
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+    cap = f"{_gpu_capability()[0]}.{_gpu_capability()[1]}" if torch.cuda.is_available() else "-"
+    print("== Precision Config ==")
+    print(f"Device: {dev} | {name} (SM {cap})")
+    print(f"Requested: {pc.mode} | Selected model dtype: {pc.model_dtype} | 4-bit compute: {pc.bnb_compute_dtype}")
+    print(f"Trainer flags -> bf16={pc.trainer_bf16} fp16={pc.trainer_fp16} | Note: {pc.note}")
+
+# ======================= Args =======================
+
 @dataclass
 class Args:
     # Base + reward
@@ -67,7 +148,7 @@ class Args:
     target_modules: Tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
 
     # PRM loader options
-    prm_load_in_4bit: bool = True    # set False if you want full-fp16 PRM
+    prm_load_in_4bit: bool = True
     prm_base_id: Optional[str] = os.environ.get("PRM_BASE_ID")  # e.g. "Qwen/Qwen2.5-3B"
 
     # SFT
@@ -85,7 +166,7 @@ class Args:
     ppo_mini_bs: int = 1
     ppo_epochs: int = 4
     ppo_lr: float = 5e-6
-    ppo_target_kl: float = 6.0
+    ppo_target_kl: float = 6.0  # used only if kl_anneal != none
     ppo_max_new_tokens: int = 512
 
     # Sampling
@@ -106,16 +187,16 @@ class Args:
     mmlu_pro_n: int = 1000
 
     # Extra RL features
-    ref_free: bool = False              # reference-free PPO (no frozen ref model)
-    entropy_beta: float = 0.0           # entropy bonus coeff (0 = off)
+    ref_free: bool = False
+    entropy_beta: float = 0.0
     kl_anneal: str = "none"             # "none" | "linear" | "cosine"
-    kl_min: float = 1.0                 # min target KL for anneal
-    kl_max: float = 6.0                 # max target KL for anneal (start)
-    eval_every: int = 100               # PPO steps between evals (0 = disable)
-    eval_gsm8k_n: int = 128             # eval subset size from GSM8K
-    reward_w_prm: float = 1.0           # weight of VersaPRM signal
-    reward_w_rule: float = 0.2          # weight of rule/safety critic
-    reward_clip_min: float = -1.0       # optional clipping
+    kl_min: float = 1.0
+    kl_max: float = 6.0
+    eval_every: int = 100
+    eval_gsm8k_n: int = 128
+    reward_w_prm: float = 1.0
+    reward_w_rule: float = 0.2
+    reward_clip_min: float = -1.0
     reward_clip_max: float = 1.0
 
     # Distributed / Hub
@@ -127,10 +208,12 @@ class Args:
     hf_token: Optional[str] = os.environ.get("HF_TOKEN")
     max_shard_size: str = "2GB"
 
+    # Precision
+    precision: str = os.environ.get("PRECISION", "auto")  # auto | bf16 | fp16 | fp32
 
 def parse_args(argv: List[str]) -> Args:
     import argparse
-    p = argparse.ArgumentParser(description="Gemma-3 CoT SFT + PPO on LoRA with KL anneal, entropy, eval, mixed rewards")
+    p = argparse.ArgumentParser(description="Gemma-3 CoT SFT + PPO on LoRA with KL anneal, entropy, eval, mixed rewards (precision-standardized)")
     p.add_argument("--prm-base-id", type=str, default=None)
     p.add_argument("--prm-load-in-4bit", action="store_true", default=None)
     p.add_argument("--no-prm-load-in-4bit", dest="prm_load_in_4bit", action="store_false")
@@ -210,6 +293,9 @@ def parse_args(argv: List[str]) -> Args:
     p.add_argument("--hf-token", type=str, default=None)
     p.add_argument("--max-shard-size", type=str, default=None)
 
+    # Precision
+    p.add_argument("--precision", type=str, choices=["auto","bf16","fp16","fp32"], default=None)
+
     ns = p.parse_args(argv)
     args = Args()
     for k, v in vars(ns).items():
@@ -279,10 +365,8 @@ def load_and_prepare_r1_distill(subset: str = "v0") -> Dataset:
     ds = load_dataset("ServiceNow-AI/R1-Distill-SFT", subset, split="train")
     def _convert(ex):
         chain = re.sub(r"</?think>", "", ex.get("reannotated_assistant_content","")).strip()
-        return {
-            "prompt": (ex.get("problem","") or "").strip(),
-            "response": f"<think>{chain}</think>\n\n{(ex.get('solution','') or '').strip()}",
-        }
+        return {"prompt": (ex.get("problem","") or "").strip(),
+                "response": f"<think>{chain}</think>\n\n{(ex.get('solution','') or '').strip()}"}
     return ds.map(_convert, remove_columns=ds.column_names)
 
 def concatenate_and_cap(dsets: List[Dataset], cap: int, seed: int) -> Dataset:
@@ -330,13 +414,6 @@ def prepare_tokenizer(path_or_id: str, left_pad: bool = False) -> AutoTokenizer:
     return tok
 
 # ======================= Collator & packing =======================
-def _safe_autodtype_for_reward() -> torch.dtype:
-    # T4 (sm_75) has no BF16; use FP16 to avoid slow FP32 + memory blowups
-    if torch.cuda.is_available():
-        major, _ = torch.cuda.get_device_capability()
-        return torch.bfloat16 if major >= 8 else torch.float16
-    return torch.float32
-
 
 def make_sft_collator(tokenizer: AutoTokenizer, max_len: int):
     def collate(batch):
@@ -375,15 +452,24 @@ def greedy_pack_examples(texts: List[str], tokenizer: AutoTokenizer, max_len: in
 
 # ======================= SFT =======================
 
-def sft_train(args: Args) -> str:
+def _dtype_for_model(model_id: str, pc: PrecisionCfg) -> torch.dtype:
+    # Gemma-3 has issues with pure fp16 — prefer bf16 if available, else fp32.
+    if _is_gemma3(model_id) and pc.model_dtype == torch.float16:
+        return torch.float32
+    return pc.model_dtype
+
+def sft_train(args: Args, pc: PrecisionCfg) -> str:
     from unsloth import FastLanguageModel
     set_seed(args.seed)
 
     os.makedirs(args.output_dir, exist_ok=True)
+
+    dtype_for_unsloth = _dtype_for_model(args.base_model_id, pc)
+
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.base_model_id,
         max_seq_length=args.max_seq_len,
-        dtype=torch.bfloat16,
+        dtype=dtype_for_unsloth,
         load_in_4bit=args.load_in_4bit,
     )
     tokenizer.add_special_tokens({"additional_special_tokens": ["<think>", "</think>"]})
@@ -418,8 +504,8 @@ def sft_train(args: Args) -> str:
         weight_decay=args.weight_decay,
         warmup_ratio=args.warmup_ratio,
         lr_scheduler_type="cosine",
-        bf16=False,
-        fp16=False,
+        bf16=pc.trainer_bf16,
+        fp16=pc.trainer_fp16,
         logging_steps=10,
         save_steps=500,
         save_total_limit=2,
@@ -445,12 +531,7 @@ def sft_train(args: Args) -> str:
 
 class VersaPRM:
     """
-    VersaPRM scoring:
-      - After each reasoning step, the PRM expects a label token ('CORRECT' / 'INCORRECT').
-      - We build: input = question + " \n\n" + (" \n\n\n\n".join(steps)) + " \n\n\n\n"
-      - We find every occurrence of the full delimiter " \n\n\n\n" in the tokenized input,
-        and at the index of its final token we read the NEXT-token distribution and compute P(CORRECT),
-        averaging across steps.
+    VersaPRM scoring helper.
     """
     def __init__(
         self,
@@ -459,14 +540,12 @@ class VersaPRM:
         correct_label_candidates=(" CORRECT", " Correct", " correct", " YES", " Yes", " yes", " True", " true"),
         incorrect_label_candidates=(" INCORRECT", " Incorrect", " incorrect", " NO", " No", " no", " False", " false"),
         step_delim: str = " \n\n\n\n",
-        # new knobs (threaded through via Args)
         load_in_4bit: Optional[bool] = None,
         base_model_id: Optional[str] = None,
+        prm_compute_dtype: Optional[torch.dtype] = None,
     ):
-        # Decide dtype compatible with T4 etc.
-        prm_dtype = _safe_autodtype_for_reward()
+        prm_dtype = prm_compute_dtype or (torch.bfloat16 if _is_bf16_supported() else torch.float16)
 
-        # Tokenizer
         self.tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
         if self.tok.eos_token is None:
             if self.tok.sep_token is not None:
@@ -478,7 +557,6 @@ class VersaPRM:
         self.tok.padding_side = "left"
         self.tok.truncation_side = "left"
 
-        # BitsAndBytes config (optional 4-bit)
         quant_cfg = None
         if load_in_4bit:
             quant_cfg = BitsAndBytesConfig(
@@ -488,11 +566,7 @@ class VersaPRM:
                 bnb_4bit_compute_dtype=prm_dtype,
             )
 
-        # Two loading paths:
-        # A) Adapter repo (recommended): provide base_model_id -> load base, then attach adapter
-        # B) Full model repo: load directly
         if base_model_id:
-            # Load base
             base_kwargs: Dict[str, Any] = dict(
                 torch_dtype=prm_dtype,
                 device_map="auto",
@@ -500,17 +574,14 @@ class VersaPRM:
             )
             if quant_cfg is not None:
                 base_kwargs["quantization_config"] = quant_cfg
-
             base = AutoModelForCausalLM.from_pretrained(base_model_id, **base_kwargs)
 
-            # Attach adapter (no .to() calls; keep accelerate hooks)
             self.model = PeftModel.from_pretrained(
                 base,
                 model_id,
                 is_trainable=False,
             )
         else:
-            # Try to load as a full model
             full_kwargs: Dict[str, Any] = dict(
                 torch_dtype=prm_dtype,
                 device_map="auto",
@@ -518,12 +589,10 @@ class VersaPRM:
             )
             if quant_cfg is not None:
                 full_kwargs["quantization_config"] = quant_cfg
-
             self.model = AutoModelForCausalLM.from_pretrained(model_id, **full_kwargs)
 
         self.model.eval()
 
-        # Scoring config
         self.step_delim = step_delim
         self.step_ids = self.tok.encode(self.step_delim, add_special_tokens=False)
         self.candidate_ids = self._resolve_candidate_ids(
@@ -570,7 +639,6 @@ class VersaPRM:
         joined = self.step_delim.join(raw_lines) + self.step_delim
         input_text = (question or "").strip() + " \n\n" + joined
 
-        # Stay on whatever devices Accelerate assigned
         device = next(self.model.parameters()).device
         ids = self.tok.encode(input_text, add_special_tokens=False)
         input_ids = torch.tensor([ids], device=device)
@@ -623,15 +691,8 @@ def rule_safety_reward(prompt: str, output: str) -> float:
 
 # ======================= PPO (LoRA-only training) =======================
 
-def _bf16_supported() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 8  # Ampere+ supports BF16
-
-def build_ppo_policy_with_lora(args: Args) -> Tuple[AutoModelForCausalLMWithValueHead, AutoTokenizer]:
-    use_bf16 = _bf16_supported()
-    dtype = torch.bfloat16 if use_bf16 else torch.float32
+def build_ppo_policy_with_lora(args: Args, pc: PrecisionCfg) -> Tuple[AutoModelForCausalLMWithValueHead, AutoTokenizer]:
+    compute_dtype = _dtype_for_model(args.base_model_id, pc)
 
     tok = AutoTokenizer.from_pretrained(args.lora_ckpt_dir, use_fast=True)
     if tok.eos_token is None:
@@ -645,7 +706,7 @@ def build_ppo_policy_with_lora(args: Args) -> Tuple[AutoModelForCausalLMWithValu
     tok.truncation_side = "left"
 
     model_kwargs: Dict[str, Any] = dict(
-        torch_dtype=dtype,
+        torch_dtype=compute_dtype,
         device_map="auto",
         low_cpu_mem_usage=True,
     )
@@ -653,7 +714,7 @@ def build_ppo_policy_with_lora(args: Args) -> Tuple[AutoModelForCausalLMWithValu
         model_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=(torch.bfloat16 if use_bf16 else torch.float32),
+            bnb_4bit_compute_dtype=pc.bnb_compute_dtype,
             bnb_4bit_quant_type="nf4",
         )
 
@@ -730,29 +791,28 @@ def evaluate_gsm8k_em(model: AutoModelForCausalLM, tok: AutoTokenizer, n: int = 
         correct += int(predn == gold)
     return {"em": correct / max(1, total), "n": total}
 
-def ppo_train(args: Args, sft_dataset: Dataset):
-    # ---- FIX: build once, do not call with extra positional args ----
-    policy, tok = build_ppo_policy_with_lora(args)
+def ppo_train(args: Args, sft_dataset: Dataset, pc: PrecisionCfg):
+    policy, tok = build_ppo_policy_with_lora(args, pc)
     ref_model = None if args.ref_free else create_reference_model(policy)
-    # -----------------------------------------------------------------
 
     prm = VersaPRM(
         args.reward_model_id,
         device=args.device,
         load_in_4bit=args.prm_load_in_4bit,
         base_model_id=args.prm_base_id,
+        prm_compute_dtype=pc.bnb_compute_dtype if args.prm_load_in_4bit else (torch.bfloat16 if _is_bf16_supported() else torch.float16),
     )
 
-    # -------- FIX HERE: drop unsupported PPOConfig arg ----------
+    # PPOConfig -> pass precision flags ONLY when supported
     cfg = PPOConfig(
         learning_rate=args.ppo_lr,
-        batch_size=args.ppo_batch_size,      # still supported
-        mini_batch_size=args.ppo_mini_bs,    # still supported
-        num_ppo_epochs=args.ppo_epochs,      # <- renamed
-        kl_coef=0.05                         # <- replaces target_kl; tune 0.02–0.1
+        batch_size=args.ppo_batch_size,
+        mini_batch_size=args.ppo_mini_bs,
+        num_ppo_epochs=args.ppo_epochs,
+        kl_coef=0.05,
+        bf16=pc.trainer_bf16,
+        fp16=pc.trainer_fp16,
     )
-
-    # ------------------------------------------------------------
 
     trainer = PPOTrainer(config=cfg, model=policy, ref_model=ref_model, tokenizer=tok)
 
@@ -787,9 +847,6 @@ def ppo_train(args: Args, sft_dataset: Dataset):
         eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
     )
-
-    def slice_response(full_seq: torch.Tensor, padded_input_len: int) -> torch.Tensor:
-        return full_seq[padded_input_len:]
 
     for epoch in range(args.ppo_epochs):
         if stop_flag["stop"]:
@@ -881,11 +938,12 @@ def ppo_train(args: Args, sft_dataset: Dataset):
 
 # ======================= Merge after PPO =======================
 
-def merge_after_ppo(args: Args) -> str:
+def merge_after_ppo(args: Args, pc: PrecisionCfg) -> str:
     print("[MERGE] Loading base and PPO LoRA for final merge...")
+    dtype_for_merge = _dtype_for_model(args.base_model_id, pc)
     base = AutoModelForCausalLM.from_pretrained(
         args.base_model_id,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=dtype_for_merge,
         device_map="auto",
         low_cpu_mem_usage=True,
     )
@@ -934,13 +992,21 @@ def gpu_info() -> List[Dict[str, Any]]:
             })
     return infos
 
-def write_manifest(args: Args, stage: str, extra: Dict[str, Any]) -> None:
+def write_manifest(args: Args, pc: PrecisionCfg, stage: str, extra: Dict[str, Any]) -> None:
     os.makedirs(args.output_dir, exist_ok=True)
     manifest = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
         "git_commit": get_git_commit(),
         "stage": stage,
         "args": asdict(args),
+        "precision": {
+            "mode": pc.mode,
+            "model_dtype": str(pc.model_dtype).split(".")[-1],
+            "bnb_compute_dtype": str(pc.bnb_compute_dtype).split(".")[-1],
+            "trainer_bf16": pc.trainer_bf16,
+            "trainer_fp16": pc.trainer_fp16,
+            "note": pc.note,
+        },
         "versions": library_versions(),
         "gpu": gpu_info(),
     }
@@ -957,11 +1023,14 @@ def main(argv: List[str]):
     set_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    write_manifest(args, stage="start", extra={})
+    pc = choose_precision(args.precision, args.base_model_id)
+    _print_precision_banner(pc)
+
+    write_manifest(args, pc, stage="start", extra={})
 
     if args.run_sft:
-        sft_dir = sft_train(args)  # saves adapters to lora_ckpt_dir
-        write_manifest(args, stage="post_sft", extra={"sft_lora_dir": sft_dir})
+        sft_dir = sft_train(args, pc)  # saves adapters to lora_ckpt_dir
+        write_manifest(args, pc, stage="post_sft", extra={"sft_lora_dir": sft_dir})
     else:
         print("[INFO] Skipping SFT; expecting existing adapters in --lora-ckpt-dir")
 
@@ -969,14 +1038,14 @@ def main(argv: List[str]):
     n = min(128000, len(ds))
     rl_ds = ds.shuffle(seed=args.seed).select(range(n))
 
-    ppo_train(args, rl_ds)
-    write_manifest(args, stage="post_ppo", extra={"ppo_lora_dir": args.ppo_lora_dir})
+    ppo_train(args, rl_ds, pc)
+    write_manifest(args, pc, stage="post_ppo", extra={"ppo_lora_dir": args.ppo_lora_dir})
 
     if args.run_merge_after_ppo:
-        merged = merge_after_ppo(args)
-        write_manifest(args, stage="done", extra={"merged_path": merged})
+        merged = merge_after_ppo(args, pc)
+        write_manifest(args, pc, stage="done", extra={"merged_path": merged})
     else:
-        write_manifest(args, stage="done", extra={"merged_path": None})
+        write_manifest(args, pc, stage="done", extra={"merged_path": None})
 
 if __name__ == "__main__":
     main(sys.argv[1:])

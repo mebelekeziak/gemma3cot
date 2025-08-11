@@ -818,7 +818,22 @@ def ppo_train(args: Args, sft_dataset: Dataset, pc: PrecisionCfg):
         fp16=pc.trainer_fp16,
     )
 
-    trainer = PPOTrainer(config=cfg, model=policy, ref_model=ref_model, tokenizer=tok)
+    
+    try:
+        trainer = PPOTrainer(
+            ppo_config=cfg,           # new TRL versions expect 'ppo_config'
+            model=policy,
+            ref_model=ref_model,
+            tokenizer=tok,
+        )
+    except TypeError:
+        # fallback for older TRL versions that take positional 'config'
+        trainer = PPOTrainer(
+            cfg,
+            model=policy,
+            ref_model=ref_model,
+            tokenizer=tok,
+        )
 
     os.makedirs(args.output_dir, exist_ok=True)
     jsonl_path = os.path.join(args.output_dir, args.jsonl_log)

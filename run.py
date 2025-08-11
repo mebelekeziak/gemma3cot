@@ -33,39 +33,49 @@ warnings.filterwarnings("ignore", category=UserWarning)
 import inspect
 
 # REPLACE make_ppo_trainer with this versioned switch:
+# drop-in replacement
 def make_ppo_trainer(cfg, policy, ref_model, tok, train_dataset, data_collator=None):
-    new_api = False
-    try:
-        new_api = V(trl_lib.__version__) >= V("0.12.0")
-    except Exception:
-        new_api = True  # safest default
+    import inspect
+    sig = inspect.signature(PPOTrainer.__init__)
+    names = set(sig.parameters)
 
-    common = {}
-    if data_collator is not None:
-        common["data_collator"] = data_collator
+    kw = {"model": policy}
 
-    if new_api:
-        # TRL >= 0.12 expects ppo_config + train_dataset
-        return PPOTrainer(
-            model=policy,
-            ref_model=ref_model,
-            tokenizer=tok,
-            reward_model=None,
-            value_model=None,
-            ppo_config=cfg,
-            train_dataset=train_dataset,
-            **common,
-        )
-    else:
-        # Older TRL expects config + dataset
-        return PPOTrainer(
-            config=cfg,
-            model=policy,
-            ref_model=ref_model,
-            tokenizer=tok,
-            dataset=train_dataset,
-            **common,
-        )
+    # config key
+    if "args" in names:
+        kw["args"] = cfg
+    elif "ppo_config" in names:
+        kw["ppo_config"] = cfg
+    elif "config" in names:
+        kw["config"] = cfg
+
+    # dataset key
+    if "train_dataset" in names:
+        kw["train_dataset"] = train_dataset
+    elif "dataset" in names:
+        kw["dataset"] = train_dataset
+
+    # ref model
+    if "ref_model" in names:
+        kw["ref_model"] = ref_model
+
+    # tokenizer vs processing_class
+    if "processing_class" in names:
+        kw["processing_class"] = tok
+    elif "tokenizer" in names:
+        kw["tokenizer"] = tok  # older TRL
+
+    # newer TRL lists these in the signature — pass None if present
+    if "reward_model" in names:
+        kw["reward_model"] = None
+    if "value_model" in names:
+        kw["value_model"] = None
+
+    if data_collator is not None and "data_collator" in names:
+        kw["data_collator"] = data_collator
+
+    return PPOTrainer(**kw)
+
 
 # ======================= Utilities =======================
 

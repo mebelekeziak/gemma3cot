@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 import os
-os.environ["TORCH_COMPILE_DISABLE"] = "1"     # PyTorch 2.5+
-os.environ["TORCHDYNAMO_DISABLE"] = "1"       # legacy switch many libs respect
-os.environ["ACCELERATE_USE_DYNAMO"] = "0"     # in case accelerate/TRL tries to enable it
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"      # quiet TF/XLA spam; harmless
+os.environ["TORCH_COMPILE_DISABLE"] = "1"   # stop torch.compile / dynamo at source
+os.environ["TORCHDYNAMO_DISABLE"] = "1"
+os.environ["ACCELERATE_USE_DYNAMO"] = "0"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"    # hush TF spam
 import os, re, json, time, signal, warnings, random, subprocess, sys
 from dataclasses import dataclass, asdict
 from typing import List, Tuple, Dict, Any, Optional
@@ -34,18 +34,13 @@ from peft import PeftModel
 warnings.filterwarnings("ignore", category=UserWarning)
 from contextlib import contextmanager
 
-@contextmanager
+from contextlib import nullcontext
+
 def no_dynamo():
-    try:
-        cm = __import__("torch").compiler.disable()
-    except Exception:
-        # older pytorch or if compiler.disable doesn't exist
-        class _Noop:
-            def __enter__(self): return None
-            def __exit__(self, *a): return False
-        cm = _Noop()
-    with cm:
-        yield
+    # torch 2.7+: compiler.disable is a DECORATOR, not a context manager.
+    # just return a noop context; we disable dynamo elsewhere.
+    return nullcontext()
+
 
 # --- TRL >= 0.21 compat: give ValueHead wrappers a base_model_prefix ---
 def _fix_trl_valuehead_base_prefix(model):
@@ -1027,6 +1022,23 @@ def build_ppo_policy_with_lora(args: Args, pc: PrecisionCfg) -> Tuple[AutoModelF
     # be explicit about gen ids (you already set elsewhere, doubling here is ok)
     policy.config.pad_token_id = tok.pad_token_id
     policy.config.eos_token_id = tok.eos_token_id
+    # force no-cache for training
+    policy.config.use_cache = False
+    if hasattr(policy, "pretrained_model") and hasattr(policy.pretrained_model, "config"):
+        policy.pretrained_model.config.use_cache = False
+
+    # explicitly mark forwards & generate as no-dynamo (decorator style)
+    try:
+        import torch._dynamo as dynamo
+        if hasattr(policy, "forward"):
+            policy.forward = dynamo.disable(policy.forward)
+        if hasattr(policy, "generate"):
+            policy.generate = dynamo.disable(policy.generate)
+        if hasattr(policy, "pretrained_model") and hasattr(policy.pretrained_model, "forward"):
+            policy.pretrained_model.forward = dynamo.disable(policy.pretrained_model.forward)
+    except Exception:
+        pass
+
 
     return policy, tok
 
@@ -1085,6 +1097,17 @@ def ppo_train(args: Args, sft_dataset: Dataset, pc: PrecisionCfg):
     ref_model = None if args.ref_free else create_reference_model(policy)
     if ref_model is not None:
         _fix_trl_valuehead_base_prefix(ref_model)
+        try:
+            import torch._dynamo as dynamo
+            if hasattr(ref_model, "forward"):
+                ref_model.forward = dynamo.disable(ref_model.forward)
+            if hasattr(ref_model, "generate"):
+                ref_model.generate = dynamo.disable(ref_model.generate)
+            if hasattr(ref_model, "pretrained_model") and hasattr(ref_model.pretrained_model, "forward"):
+                ref_model.pretrained_model.forward = dynamo.disable(ref_model.pretrained_model.forward)
+        except Exception:
+            pass
+
     ensure_generation_config(policy, tok)
     prm = VersaPRM(
         args.reward_model_id,

@@ -33,7 +33,6 @@ from peft import PeftModel
 
 warnings.filterwarnings("ignore", category=UserWarning)
 from contextlib import contextmanager
-
 from contextlib import nullcontext
 
 def no_dynamo():
@@ -106,6 +105,7 @@ class NoopRewardModel(nn.Module):
 
 
 from transformers import GenerationConfig
+from transformers.modeling_outputs import SequenceClassifierOutput
 
 def ensure_generation_config(model, tok):
     """
@@ -135,11 +135,10 @@ def ensure_generation_config(model, tok):
     model.config.pad_token_id = tok.pad_token_id
 
 
-
 import inspect
 
 # === FIXED: version-flexible, positional-safe constructor ===
-def make_ppo_trainer(cfg, policy, ref_model, tok, train_dataset, data_collator=None):
+def make_ppo_trainer(cfg, policy, ref_model, tok, train_dataset, data_collator=None, reward_model=None):
     """
     Version-flexible PPOTrainer constructor.
     Handles:
@@ -188,7 +187,7 @@ def make_ppo_trainer(cfg, policy, ref_model, tok, train_dataset, data_collator=N
         if name in ("data_collator",):
             return data_collator
         if name in ("reward_model",):
-            return NoopRewardModel(device=_dev)
+            return reward_model if reward_model is not None else NoopRewardModel(device=_dev)
         return None
 
     sig = inspect.signature(PPOTrainer.__init__)
@@ -890,6 +889,35 @@ def extract_think(text: str) -> str:
     m = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
     return m.group(1).strip() if m else text
 
+# ====== NEW: composite reward module to plug into PPO ======
+class CompositeRewardModel(nn.Module):
+    """
+    Minimal reward 'model' for new TRL PPO: returns a (batch, 1) logits tensor.
+    Internally uses your VersaPRM + rule_safety_reward. No gradients.
+    """
+    def __init__(self, tok, prm, w_prm: float = 1.0, w_rule: float = 0.2):
+        super().__init__()
+        self.tok = tok
+        self.prm = prm
+        self.w_prm = float(w_prm)
+        self.w_rule = float(w_rule)
+
+    @torch.no_grad()
+    def forward(self, input_ids=None, attention_mask=None, **kwargs):
+        device = input_ids.device
+        texts = self.tok.batch_decode(input_ids, skip_special_tokens=False)
+        rewards = []
+        for text in texts:
+            # heuristically split: everything before first <think> is the 'question'
+            q = text.split("<think>")[0].strip()
+            chain = extract_think(text)
+            prm_score = self.prm.score(q, chain)
+            rule_score = rule_safety_reward(q, text)
+            r = max(-1.0, min(1.0, self.w_prm * prm_score + self.w_rule * rule_score))
+            rewards.append(r)
+        logits = torch.tensor(rewards, dtype=torch.float32, device=device).unsqueeze(-1)
+        return SequenceClassifierOutput(logits=logits)
+
 # ======================= Rule/Safety Critic =======================
 
 BAD_PHRASES = [
@@ -1039,7 +1067,6 @@ def build_ppo_policy_with_lora(args: Args, pc: PrecisionCfg) -> Tuple[AutoModelF
     except Exception:
         pass
 
-
     return policy, tok
 
 
@@ -1086,9 +1113,9 @@ def evaluate_gsm8k_em(model: AutoModelForCausalLM, tok: AutoTokenizer, n: int = 
         text = tok.decode(out[0], skip_special_tokens=True)
         pred = parse_final_answer(text) or ""
         gold_nums = re.findall(r"[-+]?\d[\d,\.]*", ans)
-        gold = gold_nums[-1] if gold_nums else ans.strip()
+        gold = gold_nums[-1 if gold_nums else 0] if gold_nums else ans.strip()
         pred_nums = re.findall(r"[-+]?\d[\d,\.]*", pred)
-        predn = pred_nums[-1] if pred_nums else pred.strip()
+        predn = pred_nums[-1 if pred_nums else 0] if pred_nums else pred.strip()
         correct += int(predn == gold)
     return {"em": correct / max(1, total), "n": total}
 
@@ -1117,6 +1144,9 @@ def ppo_train(args: Args, sft_dataset: Dataset, pc: PrecisionCfg):
         prm_compute_dtype=pc.bnb_compute_dtype if args.prm_load_in_4bit else (torch.bfloat16 if _is_bf16_supported() else torch.float16),
     )
 
+    # ===== NEW: build composite reward module for PPO =====
+    rm = CompositeRewardModel(tok, prm, w_prm=args.reward_w_prm, w_rule=args.reward_w_rule)
+
     # PPOConfig -> pass precision flags ONLY when supported
     cfg = PPOConfig(
         learning_rate=args.ppo_lr,
@@ -1126,118 +1156,16 @@ def ppo_train(args: Args, sft_dataset: Dataset, pc: PrecisionCfg):
         kl_coef=0.05,
         bf16=pc.trainer_bf16,
         fp16=pc.trainer_fp16,
+        # we could also set generation_kwargs here via newer TRL fields if present
     )
 
-    trainer = make_ppo_trainer(cfg, policy, ref_model, tok, train_dataset=sft_dataset)
+    # Build PPOTrainer (version-flexible) with our reward model
+    trainer = make_ppo_trainer(cfg, policy, ref_model, tok, train_dataset=sft_dataset, reward_model=rm)
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    jsonl_path = os.path.join(args.output_dir, args.jsonl_log)
-    def log_jsonl(rec: Dict[str, Any]):
-        with open(jsonl_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec) + "\n")
+    # ---- kick off dataset-driven PPO (replaces manual .step loop) ----
+    trainer.train()
 
-    stop_flag = {"stop": False}
-    def handle_sigint(sig, frame):
-        print("\n[INFO] Caught signal, saving PPO LoRA and exiting...")
-        if isinstance(policy.pretrained_model, PeftModel):
-            policy.pretrained_model.save_pretrained(args.ppo_lora_dir)
-        stop_flag["stop"] = True
-    signal.signal(signal.SIGINT, handle_sigint)
-    signal.signal(signal.SIGTERM, handle_sigint)
-
-    prompts = sft_dataset["prompt"]
-    bs = args.ppo_batch_size
-    global_step = 0
-
-    gen_kwargs = dict(
-        max_new_tokens=args.ppo_max_new_tokens,
-        do_sample=True,
-        temperature=args.gen_temperature,
-        top_p=args.gen_top_p,
-        top_k=args.gen_top_k,
-        repetition_penalty=args.repetition_penalty,
-        length_penalty=args.length_penalty,
-        min_new_tokens=args.min_new_tokens,
-        eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id,
-    )
-
-    for epoch in range(args.ppo_epochs):
-        if stop_flag["stop"]:
-            break
-
-        for i in range(0, len(prompts), bs):
-            if stop_flag["stop"]:
-                break
-
-            batch_prompts = prompts[i : i + bs]
-            enc = tok(batch_prompts, return_tensors="pt", padding=True).to(args.device)
-            attn = enc["attention_mask"]
-
-            num_samples = max(1, args.reward_samples)
-            last_query_tensors, last_response_tensors = None, None
-            rewards_accum: List[List[float]] = [[] for _ in range(len(batch_prompts))]
-            dec_texts_cache: List[str] = [""] * len(batch_prompts)
-
-            for s in range(num_samples):
-                with torch.no_grad():
-                    with no_dynamo():
-                        gen = policy.generate(**enc, **gen_kwargs)
-
-                query_tensors = []
-                response_tensors = []
-                decoded_texts = []
-
-                for j in range(len(batch_prompts)):
-                    in_len = int(attn[j].sum().item())
-                    full = gen[j]
-                    query = enc["input_ids"][j, -in_len:].detach()
-                    resp = full[in_len:].detach()
-                    query_tensors.append(query)
-                    response_tensors.append(resp)
-                    dec_text = tok.decode(full, skip_special_tokens=False)
-                    decoded_texts.append(dec_text)
-
-                for j, text in enumerate(decoded_texts):
-                    think = extract_think(text)
-                    prm_score = prm.score(batch_prompts[j], think)
-                    rule_score = rule_safety_reward(batch_prompts[j], text)
-                    total = args.reward_w_prm * prm_score + args.reward_w_rule * rule_score
-                    total = max(args.reward_clip_min, min(args.reward_clip_max, total))
-                    rewards_accum[j].append(float(total))
-                    dec_texts_cache[j] = text
-
-                last_query_tensors = query_tensors
-                last_response_tensors = response_tensors
-
-            final_rewards = [float(np.mean(rs)) if len(rs) > 0 else 0.0 for rs in rewards_accum]
-
-            stats = trainer.step(last_query_tensors, last_response_tensors, final_rewards)
-            global_step += 1
-
-            log_jsonl({
-                "epoch": epoch,
-                "global_step": global_step,
-                "batch_index": i // bs,
-                "reward_mean": float(np.mean(final_rewards)),
-                "reward_min": float(np.min(final_rewards)),
-                "reward_max": float(np.max(final_rewards)),
-                "kl": float(stats.get("kl", 0.0)),
-                "entropy_beta": args.entropy_beta,
-                "loss/policy": float(stats.get("loss/policy", 0.0)) if isinstance(stats.get("loss/policy", 0.0), (int,float)) else 0.0,
-                "loss/value": float(stats.get("loss/value", 0.0)) if isinstance(stats.get("loss/value", 0.0), (int,float)) else 0.0,
-            })
-
-            if args.eval_every and (global_step % args.eval_every == 0):
-                try:
-                    eval_res = evaluate_gsm8k_em(policy.pretrained_model, tok, n=args.eval_gsm8k_n, device=args.device)
-                except Exception:
-                    eval_res = evaluate_gsm8k_em(policy, tok, n=args.eval_gsm8k_n, device=args.device)
-                log_jsonl({"eval_step": global_step, "gsm8k_em": eval_res.get("em"), "gsm8k_n": eval_res.get("n")})
-                print(f"[EVAL] step {global_step}: GSM8K EM={eval_res.get('em')} on n={eval_res.get('n')}")
-
-        print(f"[PPO] finished epoch {epoch+1}/{args.ppo_epochs}")
-
+    # ---- saving: same as before ----
     os.makedirs(args.ppo_lora_dir, exist_ok=True)
     if isinstance(policy.pretrained_model, PeftModel):
         policy.pretrained_model.save_pretrained(args.ppo_lora_dir)
@@ -1246,10 +1174,12 @@ def ppo_train(args: Args, sft_dataset: Dataset, pc: PrecisionCfg):
     final_dir = os.path.join(args.output_dir, "ppo_final_policy")
     trainer.save_pretrained(final_dir)
 
-    if args.hf_repo:
-        api = HfApi(token=args.hf_token)
-        api.create_repo(args.hf_repo, exist_ok=True)
-        api.upload_folder(folder_path=args.ppo_lora_dir, repo_id=args.hf_repo)
+    # optional: quick eval (kept minimal to not bloat runtime)
+    try:
+        eval_res = evaluate_gsm8k_em(policy.pretrained_model, tok, n=args.eval_gsm8k_n, device=args.device)
+        print(f"[EVAL] GSM8K EM={eval_res.get('em')} on n={eval_res.get('n')}")
+    except Exception:
+        pass
 
 # ======================= Merge after PPO =======================
 

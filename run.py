@@ -26,6 +26,36 @@ from peft import PeftModel
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
+
+import inspect
+
+def make_ppo_trainer(cfg, policy, ref_model, tok):
+    """
+    Build a PPOTrainer that works across TRL versions:
+      - old: PPOTrainer(config, model, ref_model, tokenizer=...)
+      - mid: PPOTrainer(config=..., model=..., ref_model=..., tokenizer=...)
+      - new: PPOTrainer(ppo_config=..., model=..., ref_model=...)  # no tokenizer kw
+    """
+    sig = inspect.signature(PPOTrainer.__init__)
+    params = sig.parameters
+    kwargs = {"model": policy, "ref_model": ref_model}
+
+    # which config kw does this TRL expect?
+    if "ppo_config" in params:
+        kwargs["ppo_config"] = cfg
+    elif "config" in params:
+        kwargs["config"] = cfg
+    else:
+        # very old TRL only takes positional config
+        if "tokenizer" in params:
+            return PPOTrainer(cfg, policy, ref_model, tokenizer=tok)
+        return PPOTrainer(cfg, policy, ref_model)
+
+    # only pass tokenizer if supported by this TRL
+    if "tokenizer" in params:
+        kwargs["tokenizer"] = tok
+
+    return PPOTrainer(**kwargs)
 # ======================= Utilities =======================
 
 def get_git_commit() -> Optional[str]:
@@ -820,12 +850,8 @@ def ppo_train(args: Args, sft_dataset: Dataset, pc: PrecisionCfg):
 
     
     try:
-        trainer = PPOTrainer(
-            ppo_config=cfg,           # new TRL versions expect 'ppo_config'
-            model=policy,
-            ref_model=ref_model,
-            tokenizer=tok,
-        )
+        trainer = make_ppo_trainer(cfg, policy, ref_model, tok)
+
     except TypeError:
         # fallback for older TRL versions that take positional 'config'
         trainer = PPOTrainer(

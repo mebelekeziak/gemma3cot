@@ -1,12 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-# kill TF/XLA spam (optional)
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-
-# make unsloth stop meddling with generate/compile and force fp32 for Gemma 3
-os.environ["UNSLOTH_DISABLE_FAST_GENERATION"] = "1"
-os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
-os.environ["UNSLOTH_FORCE_FLOAT32"] = "1"
 import os, re, json, time, signal, warnings, random, subprocess, sys
 from dataclasses import dataclass, asdict
 from typing import List, Tuple, Dict, Any, Optional

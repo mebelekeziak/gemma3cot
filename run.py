@@ -47,17 +47,16 @@ def _gpu_capability() -> Tuple[int, int]:
         return torch.cuda.get_device_capability()
     return (0, 0)
 
-def _is_bf16_supported() -> bool:
+def _bf16_hw_supported() -> bool:
+    # Only Ampere+ (SM >= 80) truly supports bf16
     if not torch.cuda.is_available():
         return False
-    # PyTorch check + SM >= 80 (Ampere+) is a good proxy
-    try:
-        if hasattr(torch.cuda, "is_bf16_supported"):
-            return bool(torch.cuda.is_bf16_supported())
-    except Exception:
-        pass
     major, _ = _gpu_capability()
     return major >= 8
+
+def _is_bf16_supported() -> bool:
+    # Keep a single source of truth
+    return _bf16_hw_supported()
 
 def _is_gemma3(model_id: str) -> bool:
     return "gemma-3" in (model_id or "").lower()
@@ -75,7 +74,7 @@ def choose_precision(mode: Optional[str], base_model_id: str) -> PrecisionCfg:
     req = (mode or os.environ.get("PRECISION") or "auto").lower()
     cuda = torch.cuda.is_available()
     major, minor = _gpu_capability()
-    bf16_ok = _is_bf16_supported()
+    bf16_ok = _bf16_hw_supported()
 
     def cfg(model_dtype, bnb_dtype, bf16_flag, fp16_flag, note):
         return PrecisionCfg(req, model_dtype, bnb_dtype, bf16_flag, fp16_flag, note)

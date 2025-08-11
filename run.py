@@ -30,42 +30,41 @@ from peft import PeftModel
 warnings.filterwarnings("ignore", category=UserWarning)
 
 
-# ---- Reward model shim for TRL >= 0.21 (works as a stub on older versions too)
-class NoopRewardModel:
+# ---- Reward model shim for TRL >= 0.21 (and older) ----
+import torch
+import torch.nn as nn
+
+class NoopRewardModel(nn.Module):
     """
-    Minimal callable that satisfies TRL's reward_model interface.
-    Returns zeros; we still pass manual rewards to trainer.step().
-    TRL will ignore this if you provide rewards to .step(...).
+    Torch module stub so TRL can call utils like disable_dropout_in_model(...)
+    without crashing. It returns a tensor of constant rewards and is never
+    actually used if you feed rewards manually to trainer.step(...).
     """
-    def __init__(self, default_value: float = 0.0):
+    def __init__(self, default_value: float = 0.0, device: str | None = None):
+        super().__init__()
         self.default_value = float(default_value)
+        # buffer only to carry a device; persistent=False so it won't save
+        self.register_buffer("_device_dummy", torch.tensor(0.0), persistent=False)
+        self._device_hint = device
 
-    def to(self, *args, **kwargs):
-        return self
-
-    def eval(self):
-        return self
-
-    def __call__(self, *args, **kwargs):
-        # Try to infer batch size from common argument shapes used by TRL
-        # (completions: list[...] or queries/prompts/etc.)
+    def forward(self, *args, **kwargs) -> torch.Tensor:
+        # infer batch size from common kwargs; fall back to 1
         bs = 1
-        for key in ("completions", "responses", "samples", "sequences"):
-            if key in kwargs and kwargs[key] is not None:
-                try:
-                    bs = len(kwargs[key])
+        for key in ("input_ids","completions","responses","samples",
+                    "sequences","queries","prompts"):
+            obj = kwargs.get(key, None)
+            if obj is None:
+                continue
+            try:
+                bs = len(obj)
+                break
+            except Exception:
+                if hasattr(obj, "shape"):
+                    bs = int(obj.shape[0])
                     break
-                except Exception:
-                    pass
-        if bs == 1:
-            for key in ("queries", "prompts"):
-                if key in kwargs and kwargs[key] is not None:
-                    try:
-                        bs = len(kwargs[key])
-                        break
-                    except Exception:
-                        pass
-        return [self.default_value] * int(bs)
+        dev = self._device_hint or self._device_dummy.device
+        return torch.full((bs,), self.default_value, dtype=torch.float32, device=dev)
+
 
 from transformers import GenerationConfig
 
@@ -123,6 +122,12 @@ def make_ppo_trainer(cfg, policy, ref_model, tok, train_dataset, data_collator=N
 
     # canonical value resolver
     def value_for(name: str):
+        critic = policy
+        # find a device for the noop model
+        try:
+            _dev = next(critic.parameters()).device
+        except Exception:
+            _dev = None
         # normalize a few alias sets
         if name in ("ppo_config", "config", "args"):
             return cfg
@@ -144,7 +149,7 @@ def make_ppo_trainer(cfg, policy, ref_model, tok, train_dataset, data_collator=N
         if name in ("data_collator",):
             return data_collator
         if name in ("reward_model",):
-            return NoopRewardModel()
+            return NoopRewardModel(device=_dev)
         return None
 
     sig = inspect.signature(PPOTrainer.__init__)

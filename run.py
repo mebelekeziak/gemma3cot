@@ -34,26 +34,23 @@ from transformers import GenerationConfig
 
 def ensure_generation_config(model, tok):
     """
-    Make sure the TRL value-head wrapper exposes a .generation_config,
-    and that it has eos/pad ids set.
-    Also mirrors onto the underlying backbone for safety.
+    ensure the wrapper exposes .generation_config and token ids are set,
+    and mirror onto the backbone.
     """
     gen_cfg = getattr(model, "generation_config", None)
     if gen_cfg is None:
         base = getattr(model, "pretrained_model", None)
-        if base is not None and hasattr(base, "generation_config") and base.generation_config is not None:
+        if base is not None and getattr(base, "generation_config", None) is not None:
             gen_cfg = base.generation_config
         else:
             gen_cfg = GenerationConfig.from_model_config(model.config)
         setattr(model, "generation_config", gen_cfg)
 
-    # ensure token ids are set everywhere
     if getattr(gen_cfg, "eos_token_id", None) is None:
         gen_cfg.eos_token_id = tok.eos_token_id
     if getattr(gen_cfg, "pad_token_id", None) is None:
         gen_cfg.pad_token_id = tok.pad_token_id
 
-    # mirror to backbone + configs too (some code paths read from there)
     base = getattr(model, "pretrained_model", None)
     if base is not None:
         base.generation_config = gen_cfg
@@ -70,45 +67,61 @@ import inspect
 # drop-in replacement
 def make_ppo_trainer(cfg, policy, ref_model, tok, train_dataset, data_collator=None):
     import inspect
+
+    # resolve actor/critic for new TRL apis (actor = backbone, critic = value-head wrapper)
+    actor = getattr(policy, "pretrained_model", None) or getattr(policy, "model", None) or policy
+    critic = policy  # the AutoModelForCausalLMWithValueHead wrapper
+
+    # make sure generation_config exists on both
+    ensure_generation_config(critic, tok)
+    if actor is not critic:
+        ensure_generation_config(actor, tok)
+
     sig = inspect.signature(PPOTrainer.__init__)
     names = set(sig.parameters)
 
-    kw = {"model": policy}
+    kw = {}
 
-    # config key
-    if "args" in names:
-        kw["args"] = cfg
-    elif "ppo_config" in names:
+    # config arg
+    if "ppo_config" in names:
         kw["ppo_config"] = cfg
     elif "config" in names:
         kw["config"] = cfg
+    elif "args" in names:
+        kw["args"] = cfg
 
-    # dataset key
+    # dataset arg
     if "train_dataset" in names:
         kw["train_dataset"] = train_dataset
     elif "dataset" in names:
         kw["dataset"] = train_dataset
 
-    # ref model
-    if "ref_model" in names:
-        kw["ref_model"] = ref_model
-
-    # tokenizer vs processing_class
+    # tokenizer/processing
     if "processing_class" in names:
         kw["processing_class"] = tok
     elif "tokenizer" in names:
-        kw["tokenizer"] = tok  # older TRL
+        kw["tokenizer"] = tok
 
-    # newer TRL lists these in the signature — pass None if present
-    if "reward_model" in names:
-        kw["reward_model"] = None
-    if "value_model" in names:
-        kw["value_model"] = None
+    # reference model naming drift
+    if "ref_model" in names:
+        kw["ref_model"] = ref_model
+    elif "reference_model" in names:
+        kw["reference_model"] = ref_model
+    elif "ref_policy_model" in names:
+        kw["ref_policy_model"] = getattr(ref_model, "pretrained_model", ref_model) if ref_model is not None else None
+
+    # new api expects separate policy/value models; old api expects a single value-head model
+    if "policy_model" in names and "value_model" in names:
+        kw["policy_model"] = actor
+        kw["value_model"]  = critic
+    elif "model" in names:
+        kw["model"] = critic
 
     if data_collator is not None and "data_collator" in names:
         kw["data_collator"] = data_collator
 
     return PPOTrainer(**kw)
+
 
 
 # ======================= Utilities =======================

@@ -30,6 +30,43 @@ from peft import PeftModel
 warnings.filterwarnings("ignore", category=UserWarning)
 
 
+# ---- Reward model shim for TRL >= 0.21 (works as a stub on older versions too)
+class NoopRewardModel:
+    """
+    Minimal callable that satisfies TRL's reward_model interface.
+    Returns zeros; we still pass manual rewards to trainer.step().
+    TRL will ignore this if you provide rewards to .step(...).
+    """
+    def __init__(self, default_value: float = 0.0):
+        self.default_value = float(default_value)
+
+    def to(self, *args, **kwargs):
+        return self
+
+    def eval(self):
+        return self
+
+    def __call__(self, *args, **kwargs):
+        # Try to infer batch size from common argument shapes used by TRL
+        # (completions: list[...] or queries/prompts/etc.)
+        bs = 1
+        for key in ("completions", "responses", "samples", "sequences"):
+            if key in kwargs and kwargs[key] is not None:
+                try:
+                    bs = len(kwargs[key])
+                    break
+                except Exception:
+                    pass
+        if bs == 1:
+            for key in ("queries", "prompts"):
+                if key in kwargs and kwargs[key] is not None:
+                    try:
+                        bs = len(kwargs[key])
+                        break
+                    except Exception:
+                        pass
+        return [self.default_value] * int(bs)
+
 from transformers import GenerationConfig
 
 def ensure_generation_config(model, tok):
@@ -66,23 +103,29 @@ import inspect
 # REPLACE make_ppo_trainer with this versioned switch:
 # drop-in replacement
 def make_ppo_trainer(cfg, policy, ref_model, tok, train_dataset, data_collator=None):
+    """
+    Version-flexible PPOTrainer constructor.
+    - TRL <= 0.11: PPOTrainer(config|args, model, ref_model, tokenizer=...)
+    - TRL 0.12–0.20: keyworded config/model/ref_model/... variants
+    - TRL >= 0.21: PPOTrainer(ppo_config=..., policy_model=..., value_model=..., reward_model=..., ref_policy_model=..., processing_class=...)
+    """
     import inspect
 
-    # resolve actor/critic for new TRL apis (actor = backbone, critic = value-head wrapper)
+    # actor/critic resolution
     actor = getattr(policy, "pretrained_model", None) or getattr(policy, "model", None) or policy
-    critic = policy  # the AutoModelForCausalLMWithValueHead wrapper
+    critic = policy  # AutoModelForCausalLMWithValueHead wrapper
 
-    # make sure generation_config exists on both
+    # make sure generation_config present everywhere
     ensure_generation_config(critic, tok)
     if actor is not critic:
         ensure_generation_config(actor, tok)
 
     sig = inspect.signature(PPOTrainer.__init__)
-    names = set(sig.parameters)
+    names = list(sig.parameters.keys())
 
     kw = {}
 
-    # config arg
+    # config
     if "ppo_config" in names:
         kw["ppo_config"] = cfg
     elif "config" in names:
@@ -90,19 +133,19 @@ def make_ppo_trainer(cfg, policy, ref_model, tok, train_dataset, data_collator=N
     elif "args" in names:
         kw["args"] = cfg
 
-    # dataset arg
+    # dataset
     if "train_dataset" in names:
         kw["train_dataset"] = train_dataset
     elif "dataset" in names:
         kw["dataset"] = train_dataset
 
-    # tokenizer/processing
+    # tokenizer / processing
     if "processing_class" in names:
         kw["processing_class"] = tok
     elif "tokenizer" in names:
         kw["tokenizer"] = tok
 
-    # reference model naming drift
+    # reference / ref policy naming drift
     if "ref_model" in names:
         kw["ref_model"] = ref_model
     elif "reference_model" in names:
@@ -110,17 +153,27 @@ def make_ppo_trainer(cfg, policy, ref_model, tok, train_dataset, data_collator=N
     elif "ref_policy_model" in names:
         kw["ref_policy_model"] = getattr(ref_model, "pretrained_model", ref_model) if ref_model is not None else None
 
-    # new api expects separate policy/value models; old api expects a single value-head model
+    # actor/critic (various possible names)
     if "policy_model" in names and "value_model" in names:
         kw["policy_model"] = actor
-        kw["value_model"]  = critic
+        kw["value_model"] = critic
+    elif "actor_model" in names and "critic_model" in names:
+        kw["actor_model"] = actor
+        kw["critic_model"] = critic
     elif "model" in names:
+        # older TRL that expects a single value-head model
         kw["model"] = critic
 
+    # reward model (newer TRL requires this)
+    if "reward_model" in names:
+        kw["reward_model"] = NoopRewardModel()
+
+    # optional collator
     if data_collator is not None and "data_collator" in names:
         kw["data_collator"] = data_collator
 
     return PPOTrainer(**kw)
+
 
 
 

@@ -32,6 +32,20 @@ from huggingface_hub import HfApi
 from peft import PeftModel
 
 warnings.filterwarnings("ignore", category=UserWarning)
+from contextlib import contextmanager
+
+@contextmanager
+def no_dynamo():
+    try:
+        cm = __import__("torch").compiler.disable()
+    except Exception:
+        # older pytorch or if compiler.disable doesn't exist
+        class _Noop:
+            def __enter__(self): return None
+            def __exit__(self, *a): return False
+        cm = _Noop()
+    with cm:
+        yield
 
 # --- TRL >= 0.21 compat: give ValueHead wrappers a base_model_prefix ---
 def _fix_trl_valuehead_base_prefix(model):
@@ -1005,6 +1019,15 @@ def build_ppo_policy_with_lora(args: Args, pc: PrecisionCfg) -> Tuple[AutoModelF
     # keep TRL >=0.21 happy
     _fix_trl_valuehead_base_prefix(policy)
 
+    # turn off KV cache during training/checkpointing paths
+    policy.config.use_cache = False
+    if hasattr(policy, "pretrained_model") and hasattr(policy.pretrained_model, "config"):
+        policy.pretrained_model.config.use_cache = False
+
+    # be explicit about gen ids (you already set elsewhere, doubling here is ok)
+    policy.config.pad_token_id = tok.pad_token_id
+    policy.config.eos_token_id = tok.eos_token_id
+
     return policy, tok
 
 
@@ -1045,7 +1068,9 @@ def evaluate_gsm8k_em(model: AutoModelForCausalLM, tok: AutoTokenizer, n: int = 
         ans = ex["answer"].strip()
         with torch.no_grad():
             enc = tok([q], return_tensors="pt").to(device)
-            out = model.generate(**enc, max_new_tokens=256, do_sample=False, eos_token_id=tok.eos_token_id, pad_token_id=tok.pad_token_id)
+            with no_dynamo():
+                out = model.generate(**enc, max_new_tokens=256, do_sample=False,
+                                    eos_token_id=tok.eos_token_id, pad_token_id=tok.pad_token_id)
         text = tok.decode(out[0], skip_special_tokens=True)
         pred = parse_final_answer(text) or ""
         gold_nums = re.findall(r"[-+]?\d[\d,\.]*", ans)
@@ -1133,7 +1158,8 @@ def ppo_train(args: Args, sft_dataset: Dataset, pc: PrecisionCfg):
 
             for s in range(num_samples):
                 with torch.no_grad():
-                    gen = policy.generate(**enc, **gen_kwargs)
+                    with no_dynamo():
+                        gen = policy.generate(**enc, **gen_kwargs)
 
                 query_tensors = []
                 response_tensors = []

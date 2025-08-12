@@ -40,6 +40,48 @@ def no_dynamo():
     # just return a noop context; we disable dynamo elsewhere.
     return nullcontext()
 
+# --- TRL 0.21+ / unsloth PPO compat: make PolicyAndValueWrapper expose .generate ---
+try:
+    # TRL 0.21+
+    try:
+        from trl.trainer.ppo_trainer import PolicyAndValueWrapper as _PAVW
+    except Exception:
+        _PAVW = None
+    # Some builds used a different name
+    if _PAVW is None:
+        try:
+            from trl.trainer.ppo_trainer import PolicyAndValueModel as _PAVW  # older alias
+        except Exception:
+            _PAVW = None
+
+    def _resolve_policy_like(self):
+        return getattr(self, "policy_model", None) or getattr(self, "actor_model", None) or getattr(self, "model", None)
+
+    if _PAVW is not None and not hasattr(_PAVW, "generate"):
+        def _paw_generate(self, *args, **kwargs):
+            pm = _resolve_policy_like(self)
+            if pm is None or not hasattr(pm, "generate"):
+                raise AttributeError("Policy wrapper has no underlying policy_model with .generate")
+            return pm.generate(*args, **kwargs)
+        _PAVW.generate = _paw_generate  # delegate
+
+        # lightly mirror generation_config and config so downstream utilities don't choke
+        if not hasattr(_PAVW, "generation_config"):
+            @property
+            def generation_config(self):
+                pm = _resolve_policy_like(self)
+                return getattr(pm, "generation_config", None)
+            _PAVW.generation_config = generation_config
+
+        if not hasattr(_PAVW, "config"):
+            @property
+            def config(self):
+                pm = _resolve_policy_like(self)
+                return getattr(pm, "config", None)
+            _PAVW.config = config
+except Exception as _e:
+    print(f"[WARN] PolicyAndValueWrapper monkey-patch skipped: {_e}")
+
 
 # --- TRL >= 0.21 compat: give ValueHead wrappers a base_model_prefix ---
 def _fix_trl_valuehead_base_prefix(model):

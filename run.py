@@ -980,6 +980,46 @@ def extract_think(text: str) -> str:
     m = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
     return m.group(1).strip() if m else text
 
+def _fully_disable_gc(model) -> None:
+    """
+    fully disable gradient checkpointing on a (wrapped) hf/trl/peft model.
+    unsloth's compiled gemma3 layers don't carry HF's _gradient_checkpointing_func,
+    so we also install a no-op just in case something toggles it later.
+    """
+    if model is None:
+        return
+    # top-level flags
+    for m in (model, getattr(model, "pretrained_model", None)):
+        if m is None:
+            continue
+        # config flag off
+        try:
+            m.config.gradient_checkpointing = False
+        except Exception:
+            pass
+        # api off
+        try:
+            m.gradient_checkpointing_disable()
+        except Exception:
+            pass
+
+    # module-level guards
+    backbone = getattr(model, "pretrained_model", model)
+    try:
+        for mod in backbone.modules():
+            if hasattr(mod, "gradient_checkpointing"):
+                try:
+                    mod.gradient_checkpointing = False
+                except Exception:
+                    pass
+            if not hasattr(mod, "_gradient_checkpointing_func"):
+                # no-op: simply call the wrapped function (no checkpointing)
+                setattr(mod, "_gradient_checkpointing_func",
+                        lambda f, *a, **k: f(*a, **k))
+    except Exception:
+        pass
+
+
 # ====== NEW: composite reward module to plug into PPO ======
 class CompositeRewardModel(nn.Module):
     """
@@ -1069,14 +1109,12 @@ def build_ppo_policy_with_lora(args: Args, pc: PrecisionCfg) -> Tuple[AutoModelF
         device_map="auto",
         low_cpu_mem_usage=True,
     )
-
-    # Only allow 4-bit on non-Gemma-3 models
     if (not is_gemma3) and args.load_in_4bit:
         model_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=pc.bnb_compute_dtype,  # bf16 on Ampere+, fp16 on pre-Ampere
+            bnb_4bit_compute_dtype=pc.bnb_compute_dtype,
         )
 
     policy = AutoModelForCausalLMWithValueHead.from_pretrained(
@@ -1101,23 +1139,6 @@ def build_ppo_policy_with_lora(args: Args, pc: PrecisionCfg) -> Tuple[AutoModelF
         # unify everything to fp32 (backbone + LoRA + v_head)
         policy.pretrained_model.to(dtype=torch.float32)
         policy.v_head.to(dtype=torch.float32)
-        # also ensure module.config has correct ids
-        policy.config.pad_token_id = tok.pad_token_id
-        policy.config.eos_token_id = tok.eos_token_id
-
-        # extra guard: upcast any stray fp16 activations to match weight dtype
-        import torch.nn as nn
-        def _force_linear_input_dtype(module: nn.Module):
-            for m in module.modules():
-                if isinstance(m, nn.Linear):
-                    old_fwd = m.forward
-                    def new_fwd(x, *args, _old=old_fwd, _m=m, **kw):
-                        if hasattr(_m, "weight") and x.dtype != _m.weight.dtype:
-                            x = x.to(_m.weight.dtype)
-                        return _old(x, *args, **kw)
-                    m.forward = new_fwd
-        _force_linear_input_dtype(policy.pretrained_model)
-
 
     # freeze all, then unfreeze LoRA and v_head
     for n, p in policy.named_parameters():
@@ -1126,25 +1147,21 @@ def build_ppo_policy_with_lora(args: Args, pc: PrecisionCfg) -> Tuple[AutoModelF
         if "lora_" in n or n.startswith("v_head"):
             p.requires_grad = True
 
-    # generation ids set
+    # ids / cache settings
     policy.config.pad_token_id = tok.pad_token_id
     policy.config.eos_token_id = tok.eos_token_id
+    if hasattr(policy, "pretrained_model") and hasattr(policy.pretrained_model, "config"):
+        policy.pretrained_model.config.pad_token_id = tok.pad_token_id
+        policy.pretrained_model.config.eos_token_id = tok.eos_token_id
+    policy.config.use_cache = False
+    if hasattr(policy, "pretrained_model") and hasattr(policy.pretrained_model, "config"):
+        policy.pretrained_model.config.use_cache = False
 
     # keep TRL >=0.21 happy
     _fix_trl_valuehead_base_prefix(policy)
 
-    # turn off KV cache during training/checkpointing paths
-    policy.config.use_cache = False
-    if hasattr(policy, "pretrained_model") and hasattr(policy.pretrained_model, "config"):
-        policy.pretrained_model.config.use_cache = False
-
-    # be explicit about gen ids (you already set elsewhere, doubling here is ok)
-    policy.config.pad_token_id = tok.pad_token_id
-    policy.config.eos_token_id = tok.eos_token_id
-    # force no-cache for training
-    policy.config.use_cache = False
-    if hasattr(policy, "pretrained_model") and hasattr(policy.pretrained_model, "config"):
-        policy.pretrained_model.config.use_cache = False
+    # >>> CRUCIAL: fully disable gradient checkpointing for PPO <<<
+    _fully_disable_gc(policy)
 
     # explicitly mark forwards & generate as no-dynamo (decorator style)
     try:
@@ -1159,7 +1176,6 @@ def build_ppo_policy_with_lora(args: Args, pc: PrecisionCfg) -> Tuple[AutoModelF
         pass
 
     return policy, tok
-
 
 
 def anneal_target_kl(kind: str, epoch_idx: int, total_epochs: int, kl_min: float, kl_max: float) -> float:
@@ -1215,6 +1231,7 @@ def ppo_train(args: Args, sft_dataset: Dataset, pc: PrecisionCfg):
     ref_model = None if args.ref_free else create_reference_model(policy)
     if ref_model is not None:
         _fix_trl_valuehead_base_prefix(ref_model)
+        _fully_disable_gc(ref_model)   # <<< add this
         try:
             import torch._dynamo as dynamo
             if hasattr(ref_model, "forward"):

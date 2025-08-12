@@ -1252,6 +1252,9 @@ def ppo_train(args: Args, sft_dataset: Dataset, pc: PrecisionCfg):
     if ref_model is not None:
         _fix_trl_valuehead_base_prefix(ref_model)
         _fully_disable_gc(ref_model)   # <<< add this
+        upcast_linear_inputs_to_weight_dtype(
+        getattr(ref_model, "pretrained_model", ref_model)
+        )
         try:
             import torch._dynamo as dynamo
             if hasattr(ref_model, "forward"):

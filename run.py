@@ -40,7 +40,8 @@ def no_dynamo():
     # just return a noop context; we disable dynamo elsewhere.
     return nullcontext()
 
-# --- TRL 0.21+ / unsloth PPO compat: make PolicyAndValueWrapper expose .generate ---
+# --- TRL 0.21+ / unsloth PPO compat: make PolicyAndValueWrapper expose .generate
+# and make .config / .generation_config WRITABLE (add setters) ---
 try:
     # TRL 0.21+
     try:
@@ -55,32 +56,55 @@ try:
             _PAVW = None
 
     def _resolve_policy_like(self):
-        return getattr(self, "policy_model", None) or getattr(self, "actor_model", None) or getattr(self, "model", None)
+        return (getattr(self, "policy_model", None)
+                or getattr(self, "actor_model", None)
+                or getattr(self, "model", None))
 
-    if _PAVW is not None and not hasattr(_PAVW, "generate"):
-        def _paw_generate(self, *args, **kwargs):
+    if _PAVW is not None:
+        # delegate .generate to underlying policy
+        if not hasattr(_PAVW, "generate"):
+            def _paw_generate(self, *args, **kwargs):
+                pm = _resolve_policy_like(self)
+                if pm is None or not hasattr(pm, "generate"):
+                    raise AttributeError("Policy wrapper has no underlying policy_model with .generate")
+                return pm.generate(*args, **kwargs)
+            _PAVW.generate = _paw_generate
+
+        # ----- generation_config: getter + setter -----
+        def _get_generation_config(self):
             pm = _resolve_policy_like(self)
-            if pm is None or not hasattr(pm, "generate"):
-                raise AttributeError("Policy wrapper has no underlying policy_model with .generate")
-            return pm.generate(*args, **kwargs)
-        _PAVW.generate = _paw_generate  # delegate
+            return getattr(pm, "generation_config", getattr(self, "_shadow_generation_config", None))
+        def _set_generation_config(self, value):
+            pm = _resolve_policy_like(self)
+            try:
+                if pm is not None:
+                    pm.generation_config = value
+            finally:
+                # keep a shadow to satisfy future reads even if pm rejects assignment
+                try:
+                    self.__dict__["_shadow_generation_config"] = value
+                except Exception:
+                    pass
+        _PAVW.generation_config = property(_get_generation_config, _set_generation_config)
 
-        # lightly mirror generation_config and config so downstream utilities don't choke
-        if not hasattr(_PAVW, "generation_config"):
-            @property
-            def generation_config(self):
-                pm = _resolve_policy_like(self)
-                return getattr(pm, "generation_config", None)
-            _PAVW.generation_config = generation_config
-
-        if not hasattr(_PAVW, "config"):
-            @property
-            def config(self):
-                pm = _resolve_policy_like(self)
-                return getattr(pm, "config", None)
-            _PAVW.config = config
+        # ----- config: getter + setter (THIS fixes the crash) -----
+        def _get_config(self):
+            pm = _resolve_policy_like(self)
+            return getattr(pm, "config", getattr(self, "_shadow_config", None))
+        def _set_config(self, value):
+            pm = _resolve_policy_like(self)
+            try:
+                if pm is not None:
+                    pm.config = value
+            finally:
+                try:
+                    self.__dict__["_shadow_config"] = value
+                except Exception:
+                    pass
+        _PAVW.config = property(_get_config, _set_config)
 except Exception as _e:
     print(f"[WARN] PolicyAndValueWrapper monkey-patch skipped: {_e}")
+
 
 
 # --- TRL >= 0.21 compat: give ValueHead wrappers a base_model_prefix ---

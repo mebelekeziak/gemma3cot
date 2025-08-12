@@ -605,6 +605,23 @@ def _normalize_angle_tags(text: str) -> str:
         return text
     return text.replace(_SINGLE_ANGLE_OPEN, "<").replace(_SINGLE_ANGLE_CLOSE, ">")
 
+def upcast_linear_inputs_to_weight_dtype(module: nn.Module) -> None:
+    """
+    Ensure every nn.Linear sees inputs in the same dtype as its weights.
+    This fixes Half (activations) vs Float (weights) mismatches from Unsloth's fp16 paths.
+    """
+    if module is None:
+        return
+    for m in module.modules():
+        if isinstance(m, nn.Linear):
+            old_fwd = m.forward
+            def new_fwd(x, *args, _old=old_fwd, _m=m, **kw):
+                w = getattr(_m, "weight", None)
+                if w is not None and x.dtype != w.dtype:
+                    x = x.to(w.dtype)
+                return _old(x, *args, **kw)
+            m.forward = new_fwd
+
 def load_and_prepare_longtalk() -> Dataset:
     ds = load_dataset("kenhktsui/longtalk-cot-v0.1", split="train")
     def _convert(ex):
@@ -1134,6 +1151,9 @@ def build_ppo_policy_with_lora(args: Args, pc: PrecisionCfg) -> Tuple[AutoModelF
         args.lora_ckpt_dir,
         is_trainable=True,
     )
+
+    # make matmul dtypes consistent for all Linear ops
+    upcast_linear_inputs_to_weight_dtype(policy.pretrained_model)
 
     if is_gemma3:
         # unify everything to fp32 (backbone + LoRA + v_head)

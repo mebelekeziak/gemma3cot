@@ -11,12 +11,12 @@ from packaging.version import parse as V
 # --------------------------
 def _pip(*args):
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--no-input"] + list(args))
-
+"""
 _pip(
     "fastapi==0.111.0", "uvicorn==0.30.1", "pydantic==2.8.2", "starlette==0.37.2",
     "transformers>=4.44.0", "accelerate>=0.33.0", "bitsandbytes>=0.43.0",
     "python-multipart", "orjson", "pyngrok==7.1.6"
-)
+)"""
 
 # --------------------------
 # 2) Imports

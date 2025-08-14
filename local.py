@@ -1,22 +1,26 @@
-# ✅ Self-contained Colab cell: Hermes-3 (Llama 3.1-8B) 4-bit API + Public Tunnel (ngrok or Cloudflare binary)
+# ✅ Cross-platform Hermes-3 (Llama 3.x) 4-bit API + Public Tunnel (ngrok or Cloudflare)
+# - Works on Windows, Linux, macOS
 # - If env NGROK_AUTHTOKEN is set -> ngrok
-# - Else -> downloads cloudflared binary (no account) and exposes a Quick Tunnel
-# - Prints public URL you can hit from your laptop UI
+# - Else -> downloads the right cloudflared binary for your OS and exposes a Quick Tunnel
+# - Prints a public URL you can hit from your laptop UI
+# - Full, self-contained script (no placeholders)
 
-import os, sys, json, time, threading, signal, re, subprocess, shutil, urllib.request, stat
+import os, sys, json, time, threading, signal, re, subprocess, shutil, urllib.request, stat, tempfile, platform, pathlib
 from packaging.version import parse as V
 
 # --------------------------
-# 1) Install Python deps (skip torch to avoid Colab conflicts)
+# 1) Optional: pip installs (commented by default)
 # --------------------------
 def _pip(*args):
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--no-input"] + list(args))
+
 """
 _pip(
     "fastapi==0.111.0", "uvicorn==0.30.1", "pydantic==2.8.2", "starlette==0.37.2",
     "transformers>=4.44.0", "accelerate>=0.33.0", "bitsandbytes>=0.43.0",
     "python-multipart", "orjson", "pyngrok==7.1.6"
-)"""
+)
+"""
 
 # --------------------------
 # 2) Imports
@@ -32,21 +36,21 @@ from transformers import (
 # --------------------------
 # 3) Environment & config
 # --------------------------
-# If you want to silence bnb CUDA mismatch warnings, uncomment next line:
-# os.environ["BNB_CUDA_VERSION"] = ""
-os.environ.setdefault("LD_LIBRARY_PATH", "/usr/local/cuda/lib64:" + os.environ.get("LD_LIBRARY_PATH",""))
+# Only set LD_LIBRARY_PATH on POSIX (Linux/macOS)
+if os.name == "posix":
+    os.environ.setdefault("LD_LIBRARY_PATH", "/usr/local/cuda/lib64:" + os.environ.get("LD_LIBRARY_PATH",""))
 
 API_KEY         = os.environ.get("API_KEY", "")  # optional bearer token
-MODEL_ID        = os.environ.get("MODEL_ID", "NousResearch/Hermes-3-Llama-3.1-3B")
+MODEL_ID        = os.environ.get("MODEL_ID", "NousResearch/Hermes-3-Llama-3.2-3B")
 SYSTEM_PROMPT   = os.environ.get("SYSTEM_PROMPT", "You are a helpful, concise assistant.")
 MAX_HISTORY     = int(os.environ.get("MAX_HISTORY_TURNS", "16"))
-PORT            = int(os.environ.get("PORT", "8000"))
+PORT            = int(os.environ.get("PORT", "8001"))
 BNB_4BIT_TYPE   = os.environ.get("BNB_4BIT_TYPE", "fp4")   # 'fp4' or 'nf4'
 TORCH_DTYPE_STR = os.environ.get("TORCH_DTYPE", "bfloat16") # 'bfloat16' or 'float16'
 NGROK_TOKEN     = os.environ.get("NGROK_AUTHTOKEN", "").strip()
 
 if not torch.cuda.is_available():
-    raise SystemExit("❌ No CUDA GPU detected. Switch Colab runtime to GPU.")
+    raise SystemExit("❌ No CUDA GPU detected. Install CUDA drivers and ensure a CUDA-capable GPU is available.")
 
 if V(HF_VER) < V("4.44.0"):
     raise SystemExit("❌ Transformers too old. Please upgrade to >= 4.44.0.")
@@ -166,7 +170,7 @@ def run_uvicorn():
 
 server_thread = threading.Thread(target=run_uvicorn, daemon=True)
 server_thread.start()
-time.sleep(2.0)  # give server a moment
+time.sleep(1.5)  # give server a moment
 
 # --------------------------
 # 8) Public tunnel (prefer ngrok if token set, else Cloudflare binary)
@@ -180,24 +184,76 @@ def start_ngrok(port: int, token: str):
         ngrok.set_auth_token(token)
     return str(ngrok.connect(addr=port))
 
-def ensure_cloudflared_binary():
-    # Try existing binary
-    for cand in ("cloudflared", "/usr/local/bin/cloudflared", "/usr/bin/cloudflared", "/content/cloudflared"):
-        if shutil.which(cand):
-            return shutil.which(cand)
-
-    # Download latest linux-amd64 binary from GitHub releases
-    url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
-    dst = "/content/cloudflared"
-    print("⬇️  Downloading cloudflared binary...")
+def _dl(url: str, dst: str):
+    # ensure parent dir exists
+    pathlib.Path(dst).parent.mkdir(parents=True, exist_ok=True)
     urllib.request.urlretrieve(url, dst)
-    os.chmod(dst, os.stat(dst).st_mode | stat.S_IEXEC)
-    return dst
+
+def ensure_cloudflared_binary() -> str:
+    # 1) if already on PATH, use it
+    existing = shutil.which("cloudflared")
+    if existing:
+        return existing
+
+    system = platform.system().lower()
+    tmp_dir = os.path.join(tempfile.gettempdir(), "cloudflared-bin")
+    pathlib.Path(tmp_dir).mkdir(parents=True, exist_ok=True)
+
+    if "windows" in system:
+        # Windows: use .exe
+        dst = os.path.join(tmp_dir, "cloudflared.exe")
+        if not os.path.isfile(dst):
+            url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+            print("⬇️  Downloading cloudflared (Windows)...")
+            _dl(url, dst)
+        return dst
+
+    elif "linux" in system:
+        dst = os.path.join(tmp_dir, "cloudflared")
+        if not os.path.isfile(dst):
+            url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+            print("⬇️  Downloading cloudflared (Linux)...")
+            _dl(url, dst)
+            os.chmod(dst, os.stat(dst).st_mode | stat.S_IEXEC)
+        return dst
+
+    elif "darwin" in system:  # macOS (Intel/Apple Silicon)
+        # Cloudflare provides a universal pkg; the standalone binary naming can vary.
+        # We'll use the darwin-amd64 binary which works under Rosetta on Apple Silicon if needed.
+        dst = os.path.join(tmp_dir, "cloudflared")
+        if not os.path.isfile(dst):
+            url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tgz"
+            print("⬇️  Downloading cloudflared (macOS)...")
+            tgz = os.path.join(tmp_dir, "cloudflared.tgz")
+            _dl(url, tgz)
+            import tarfile
+            with tarfile.open(tgz, "r:gz") as tf:
+                # find the binary inside the tarball
+                member = next((m for m in tf.getmembers() if m.name.endswith("cloudflared")), None)
+                if not member:
+                    raise RuntimeError("cloudflared binary not found in tgz")
+                tf.extract(member, tmp_dir)
+                extracted_path = os.path.join(tmp_dir, member.name)
+                shutil.move(extracted_path, dst)
+            os.chmod(dst, os.stat(dst).st_mode | stat.S_IEXEC)
+        return dst
+
+    else:
+        raise RuntimeError(f"Unsupported OS for automatic cloudflared download: {system}")
 
 def start_cloudflared(port: int):
     bin_path = ensure_cloudflared_binary()
     cmd = [bin_path, "tunnel", "--url", f"http://localhost:{port}", "--no-autoupdate", "--protocol", "http2"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    # On Windows, avoid shell=True; capture stdout to parse the URL
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        encoding="utf-8",
+        errors="ignore",
+    )
     url = None
     pattern = re.compile(r"(https://[a-z0-9.-]+trycloudflare\.com)")
     start_time = time.time()

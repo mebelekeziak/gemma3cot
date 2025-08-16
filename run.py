@@ -1,19 +1,21 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 import os
-os.environ["TORCH_COMPILE_DISABLE"] = "1"   # stop torch.compile / dynamo at source
+os.environ["TORCH_COMPILE_DISABLE"] = "1"
 os.environ["TORCHDYNAMO_DISABLE"] = "1"
 os.environ["ACCELERATE_USE_DYNAMO"] = "0"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"    # hush TF spam
-import os, re, json, time, signal, warnings, random, subprocess, sys
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+import os, re, json, time, signal, warnings, random, subprocess, sys, inspect, math
 from dataclasses import dataclass, asdict
 from typing import List, Tuple, Dict, Any, Optional
-# ADD near your imports:
+
 from packaging.version import parse as V
 import trl as trl_lib
 
 import numpy as np
 import torch
+import torch.nn as nn
 from datasets import load_dataset, concatenate_datasets, Dataset
 from transformers import (
     AutoTokenizer,
@@ -21,7 +23,9 @@ from transformers import (
     TrainingArguments,
     Trainer,
     BitsAndBytesConfig,
+    GenerationConfig,
 )
+from transformers.modeling_outputs import SequenceClassifierOutput
 from trl import (
     AutoModelForCausalLMWithValueHead,
     PPOConfig,
@@ -36,22 +40,17 @@ from contextlib import contextmanager
 from contextlib import nullcontext
 
 def no_dynamo():
-    # torch 2.7+: compiler.disable is a DECORATOR, not a context manager.
-    # just return a noop context; we disable dynamo elsewhere.
     return nullcontext()
 
-# --- TRL 0.21+ / unsloth PPO compat: make PolicyAndValueWrapper expose .generate
-# and make .config / .generation_config WRITABLE (add setters) ---
+# --- TRL 0.21+ wrappers: ensure .generate and writable configs on PolicyAndValueWrapper ---
 try:
-    # TRL 0.21+
     try:
         from trl.trainer.ppo_trainer import PolicyAndValueWrapper as _PAVW
     except Exception:
         _PAVW = None
-    # Some builds used a different name
     if _PAVW is None:
         try:
-            from trl.trainer.ppo_trainer import PolicyAndValueModel as _PAVW  # older alias
+            from trl.trainer.ppo_trainer import PolicyAndValueModel as _PAVW
         except Exception:
             _PAVW = None
 
@@ -61,7 +60,6 @@ try:
                 or getattr(self, "model", None))
 
     if _PAVW is not None:
-        # delegate .generate to underlying policy
         if not hasattr(_PAVW, "generate"):
             def _paw_generate(self, *args, **kwargs):
                 pm = _resolve_policy_like(self)
@@ -70,7 +68,6 @@ try:
                 return pm.generate(*args, **kwargs)
             _PAVW.generate = _paw_generate
 
-        # ----- generation_config: getter + setter -----
         def _get_generation_config(self):
             pm = _resolve_policy_like(self)
             return getattr(pm, "generation_config", getattr(self, "_shadow_generation_config", None))
@@ -80,14 +77,12 @@ try:
                 if pm is not None:
                     pm.generation_config = value
             finally:
-                # keep a shadow to satisfy future reads even if pm rejects assignment
                 try:
                     self.__dict__["_shadow_generation_config"] = value
                 except Exception:
                     pass
         _PAVW.generation_config = property(_get_generation_config, _set_generation_config)
 
-        # ----- config: getter + setter (THIS fixes the crash) -----
         def _get_config(self):
             pm = _resolve_policy_like(self)
             return getattr(pm, "config", getattr(self, "_shadow_config", None))
@@ -105,57 +100,33 @@ try:
 except Exception as _e:
     print(f"[WARN] PolicyAndValueWrapper monkey-patch skipped: {_e}")
 
-
-
-# --- TRL >= 0.21 compat: give ValueHead wrappers a base_model_prefix ---
 def _fix_trl_valuehead_base_prefix(model):
-    """
-    TRL >= 0.21 does: getattr(value_model, value_model.base_model_prefix)
-    AutoModelForCausalLMWithValueHead lacks base_model_prefix.
-    This sets it to 'pretrained_model' so TRL can reach the backbone.
-    """
     try:
-        # if it's already set, do nothing
         getattr(model, "base_model_prefix")
         return model
     except AttributeError:
         pass
-
     if hasattr(model, "pretrained_model"):
-        # normal path for AutoModelForCausalLMWithValueHead
         model.base_model_prefix = "pretrained_model"
     elif hasattr(model, "model"):
         model.base_model_prefix = "model"
     elif hasattr(model, "transformer"):
         model.base_model_prefix = "transformer"
     else:
-        # last resort: point to self so getattr(...) won't crash
         model.base_model_prefix = ""
     return model
 
-
-# ---- Reward model shim for TRL >= 0.21 (and older) ----
-import torch
-import torch.nn as nn
-
+# ----- Noop reward model stub (kept for compatibility) -----
 class NoopRewardModel(nn.Module):
-    """
-    Torch module stub so TRL can call utils like disable_dropout_in_model(...)
-    without crashing. It returns a tensor of constant rewards and is never
-    actually used if you feed rewards manually to trainer.step(...).
-    """
     def __init__(self, default_value: float = 0.0, device: str | None = None):
         super().__init__()
         self.default_value = float(default_value)
-        # buffer only to carry a device; persistent=False so it won't save
         self.register_buffer("_device_dummy", torch.tensor(0.0), persistent=False)
         self._device_hint = device
 
     def forward(self, *args, **kwargs) -> torch.Tensor:
-        # infer batch size from common kwargs; fall back to 1
         bs = 1
-        for key in ("input_ids","completions","responses","samples",
-                    "sequences","queries","prompts"):
+        for key in ("input_ids","completions","responses","samples","sequences","queries","prompts"):
             obj = kwargs.get(key, None)
             if obj is None:
                 continue
@@ -169,15 +140,7 @@ class NoopRewardModel(nn.Module):
         dev = self._device_hint or self._device_dummy.device
         return torch.full((bs,), self.default_value, dtype=torch.float32, device=dev)
 
-
-from transformers import GenerationConfig
-from transformers.modeling_outputs import SequenceClassifierOutput
-
 def ensure_generation_config(model, tok):
-    """
-    ensure the wrapper exposes .generation_config and token ids are set,
-    and mirror onto the backbone.
-    """
     gen_cfg = getattr(model, "generation_config", None)
     if gen_cfg is None:
         base = getattr(model, "pretrained_model", None)
@@ -200,39 +163,21 @@ def ensure_generation_config(model, tok):
     model.config.eos_token_id = tok.eos_token_id
     model.config.pad_token_id = tok.pad_token_id
 
-
-import inspect
-
-# === FIXED: version-flexible, positional-safe constructor ===
+# === version-flexible PPOTrainer constructor ===
 def make_ppo_trainer(cfg, policy, ref_model, tok, train_dataset, data_collator=None, reward_model=None):
-    """
-    Version-flexible PPOTrainer constructor.
-    Handles:
-      - TRL <= 0.11: PPOTrainer(config|args, model, ref_model, tokenizer=...)
-      - TRL 0.12–0.20: keyworded config/model/ref_model/... variants
-      - TRL >= 0.21: may require POSitional-only (policy_model, value_model, ...) args
-    We introspect the signature and:
-      * supply positional-only args in-order via *args
-      * pass the rest via **kwargs
-      * fallback to older minimal API if needed
-    """
-    # resolve actor/critic
     actor = getattr(policy, "pretrained_model", None) or getattr(policy, "model", None) or policy
-    critic = policy  # AutoModelForCausalLMWithValueHead wrapper
+    critic = policy
 
     ensure_generation_config(critic, tok)
     if actor is not critic:
         ensure_generation_config(actor, tok)
 
-    # canonical value resolver
     def value_for(name: str):
         critic = policy
-        # find a device for the noop model
         try:
             _dev = next(critic.parameters()).device
         except Exception:
             _dev = None
-        # normalize a few alias sets
         if name in ("ppo_config", "config", "args"):
             return cfg
         if name in ("policy_model", "actor_model"):
@@ -240,7 +185,6 @@ def make_ppo_trainer(cfg, policy, ref_model, tok, train_dataset, data_collator=N
         if name in ("value_model", "critic_model"):
             return critic
         if name in ("model",):
-            # old API single-arg "model" expects value-head wrapper
             return critic
         if name in ("ref_model", "reference_model"):
             return ref_model
@@ -257,18 +201,15 @@ def make_ppo_trainer(cfg, policy, ref_model, tok, train_dataset, data_collator=N
         return None
 
     sig = inspect.signature(PPOTrainer.__init__)
-    params = list(sig.parameters.values())[1:]  # skip self
+    params = list(sig.parameters.values())[1:]
 
-    # Build positional-only args (and optionally required positional-or-keyword without defaults)
     pos_args = []
     kw_args: Dict[str, Any] = {}
 
     for p in params:
-        # if it's positional-only, we MUST pass by position
         if p.kind == inspect.Parameter.POSITIONAL_ONLY:
             val = value_for(p.name)
             if val is None and p.default is inspect._empty:
-                # try a couple of sensible fallbacks based on common orders
                 if p.name.lower().startswith("policy"):
                     val = actor
                 elif p.name.lower().startswith("value"):
@@ -279,13 +220,10 @@ def make_ppo_trainer(cfg, policy, ref_model, tok, train_dataset, data_collator=N
                     val = cfg
             pos_args.append(val)
         else:
-            # try to give by keyword if we have a value
             val = value_for(p.name)
             if val is not None:
                 kw_args[p.name] = val
 
-    # If nothing positional-only was detected but we still might be on a newer TRL that
-    # made these required POSITIONAL_OR_KEYWORD without defaults, ensure we include them.
     required_names = {p.name for p in params if (p.default is inspect._empty and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY))}
     for rn in required_names:
         if rn not in kw_args:
@@ -293,19 +231,15 @@ def make_ppo_trainer(cfg, policy, ref_model, tok, train_dataset, data_collator=N
             if val is not None:
                 kw_args[rn] = val
 
-    # Safety: don't pass None for collator if not needed
     if "data_collator" in kw_args and kw_args["data_collator"] is None:
         kw_args.pop("data_collator")
 
-    # First attempt: as constructed
     try:
         return PPOTrainer(*pos_args, **kw_args)
     except TypeError as e1:
-        # Second attempt: old API variant
         try:
             return PPOTrainer(cfg, critic, ref_model, tokenizer=tok, dataset=train_dataset, data_collator=data_collator)
         except TypeError:
-            # Third attempt: some newer builds may dislike processing_class vs tokenizer
             kw2 = dict(kw_args)
             if "processing_class" in kw2:
                 pc = kw2.pop("processing_class")
@@ -313,12 +247,9 @@ def make_ppo_trainer(cfg, policy, ref_model, tok, train_dataset, data_collator=N
             try:
                 return PPOTrainer(*pos_args, **kw2)
             except TypeError as e3:
-                # Final: raise with context
                 raise TypeError(f"PPOTrainer construction failed.\nFirst error: {e1}\nThird error: {e3}\nSignature seen: {sig}\npos_args={ [type(a).__name__ for a in pos_args] }\nkw={ list(kw_args.keys()) }")
 
-
 # ======================= Utilities =======================
-
 def get_git_commit() -> Optional[str]:
     try:
         return subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL).decode().strip()
@@ -339,14 +270,12 @@ def _gpu_capability() -> Tuple[int, int]:
     return (0, 0)
 
 def _bf16_hw_supported() -> bool:
-    # Only Ampere+ (SM >= 80) truly supports bf16
     if not torch.cuda.is_available():
         return False
     major, _ = _gpu_capability()
     return major >= 8
 
 def _is_bf16_supported() -> bool:
-    # Keep a single source of truth
     return _bf16_hw_supported()
 
 def _is_gemma3(model_id: str) -> bool:
@@ -354,9 +283,9 @@ def _is_gemma3(model_id: str) -> bool:
 
 @dataclass
 class PrecisionCfg:
-    mode: str                 # "auto", "bf16", "fp16", "fp32"
-    model_dtype: torch.dtype  # dtype to load policy/models with
-    bnb_compute_dtype: torch.dtype  # dtype for 4-bit compute
+    mode: str
+    model_dtype: torch.dtype
+    bnb_compute_dtype: torch.dtype
     trainer_bf16: bool
     trainer_fp16: bool
     note: str
@@ -364,7 +293,6 @@ class PrecisionCfg:
 def choose_precision(mode: Optional[str], base_model_id: str) -> PrecisionCfg:
     req = (mode or os.environ.get("PRECISION") or "auto").lower()
     cuda = torch.cuda.is_available()
-    major, minor = _gpu_capability()
     bf16_ok = _bf16_hw_supported()
 
     def cfg(model_dtype, bnb_dtype, bf16_flag, fp16_flag, note):
@@ -375,14 +303,12 @@ def choose_precision(mode: Optional[str], base_model_id: str) -> PrecisionCfg:
 
     if req == "bf16":
         if not bf16_ok:
-            # fallback: for Gemma-3 we must not use fp16 -> use fp32
             if _is_gemma3(base_model_id):
                 return cfg(torch.float32, torch.float16, False, False, "forced bf16 but unsupported; Gemma-3 -> fp32")
             return cfg(torch.float16, torch.float16, False, True, "forced bf16 but unsupported; fallback fp16")
         return cfg(torch.bfloat16, torch.bfloat16, True, False, "forced bf16")
 
     if req == "fp16":
-        # Gemma-3 doesn't run correctly in fp16 => force fp32
         if _is_gemma3(base_model_id):
             return cfg(torch.float32, torch.float16, False, False, "Gemma-3 forbids fp16 -> using fp32")
         return cfg(torch.float16, torch.float16, False, True, "forced fp16")
@@ -390,16 +316,12 @@ def choose_precision(mode: Optional[str], base_model_id: str) -> PrecisionCfg:
     if req == "fp32":
         return cfg(torch.float32, torch.float16, False, False, "forced fp32")
 
-    # AUTO
     if cuda and bf16_ok:
-        # H100/H200/Ampere etc.
         return cfg(torch.bfloat16, torch.bfloat16, True, False, "auto->bf16 (Ampere/Hopper)")
     if cuda:
-        # Pre-Ampere like T4. Gemma-3 cannot use fp16 -> fp32
         if _is_gemma3(base_model_id):
             return cfg(torch.float32, torch.float16, False, False, "auto on Turing + Gemma-3 -> fp32")
         return cfg(torch.float16, torch.float16, False, True, "auto on pre-Ampere -> fp16")
-    # CPU
     return cfg(torch.float32, torch.float16, False, False, "auto on CPU -> fp32")
 
 def _print_precision_banner(pc: PrecisionCfg):
@@ -412,36 +334,29 @@ def _print_precision_banner(pc: PrecisionCfg):
     print(f"Trainer flags -> bf16={pc.trainer_bf16} fp16={pc.trainer_fp16} | Note: {pc.note}")
 
 # ======================= Args =======================
-
 @dataclass
 class Args:
-    # Base + reward
     base_model_id: str = os.environ.get("BASE_MODEL_ID", "google/gemma-3-27b-it")
     reward_model_id: str = os.environ.get("REWARD_MODEL_ID", "UW-Madison-Lee-Lab/VersaPRM-Base-3B")
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Flow toggles
     run_sft: bool = True
     run_merge_after_ppo: bool = True
-    rl_on_lora: bool = True  # keep for clarity; PPO trains LoRA + v-head only
+    rl_on_lora: bool = True
 
-    # Paths
     merged_path: str = "./gemma3_cot_sft_merged"
     lora_ckpt_dir: str = "./gemma3_cot_sft_lora"
     ppo_lora_dir: str = "./gemma3_cot_ppo_lora"
     output_dir: str = "./runs/gemma3_cot"
 
-    # LoRA (SFT)
     lora_r: int = 32
     lora_alpha: int = 32
     lora_dropout: float = 0.05
     target_modules: Tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
 
-    # PRM loader options
     prm_load_in_4bit: bool = True
-    prm_base_id: Optional[str] = os.environ.get("PRM_BASE_ID")  # e.g. "Qwen/Qwen2.5-3B"
+    prm_base_id: Optional[str] = os.environ.get("PRM_BASE_ID")
 
-    # SFT
     max_seq_len: int = 2048
     sft_epochs: int = 1
     sft_lr: float = 1e-4
@@ -451,15 +366,13 @@ class Args:
     seed: int = 42
     pack_sequences: bool = False
 
-    # PPO core
     ppo_batch_size: int = 4
     ppo_mini_bs: int = 1
     ppo_epochs: int = 4
     ppo_lr: float = 5e-6
-    ppo_target_kl: float = 6.0  # used only if kl_anneal != none
+    ppo_target_kl: float = 6.0
     ppo_max_new_tokens: int = 512
 
-    # Sampling
     gen_temperature: float = 0.7
     gen_top_p: float = 0.9
     gen_top_k: int = 0
@@ -467,29 +380,25 @@ class Args:
     min_new_tokens: int = 16
     length_penalty: float = 1.0
 
-    # Reward sampling/averaging
     reward_samples: int = 1
     reward_temperature: float = 0.7
 
-    # Data sampling caps (0 -> all)
     longtalk_n: int = 0
     gsm8k_n: int = 0
     mmlu_pro_n: int = 1000
 
-    # Extra RL features
     ref_free: bool = False
     entropy_beta: float = 0.0
-    kl_anneal: str = "none"             # "none" | "linear" | "cosine"
+    kl_anneal: str = "none"
     kl_min: float = 1.0
     kl_max: float = 6.0
     eval_every: int = 100
     eval_gsm8k_n: int = 128
     reward_w_prm: float = 1.0
-    reward_w_rule: float = 0.2
+    reward_w_rule: float = 0.2  # repurposed below as w_format (kept for CLI compat)
     reward_clip_min: float = -1.0
     reward_clip_max: float = 1.0
 
-    # Distributed / Hub
     fsdp: bool = False
     deepspeed_config: Optional[str] = None
     manifest_name: str = "manifest.json"
@@ -498,15 +407,26 @@ class Args:
     hf_token: Optional[str] = os.environ.get("HF_TOKEN")
     max_shard_size: str = "2GB"
 
-    # Precision
-    precision: str = os.environ.get("PRECISION", "auto")  # auto | bf16 | fp16 | fp32
+    precision: str = os.environ.get("PRECISION", "auto")
+
+    # ===== New: Faithfulness knobs =====
+    reward_w_consistency: float = 0.6   # AFC (answer-from-chain) main driver
+    reward_w_format: float = 0.2        # structure/anti-spam (reuses old --reward-w-rule if passed)
+    reward_w_nli: float = 0.2           # entailment weight (auto-gated)
+    use_nli: bool = True                # enable NLI component
+    nli_model_id: str = "microsoft/deberta-base-mnli"
+    consistency_num_tol: float = 1e-4   # numeric tolerance for AFC
+    nli_dynamic_gate: bool = True       # auto-disable NLI for open-ended/code/writing
 
 def parse_args(argv: List[str]) -> Args:
     import argparse
-    p = argparse.ArgumentParser(description="Gemma-3 CoT SFT + PPO on LoRA with KL anneal, entropy, eval, mixed rewards (precision-standardized)")
+    p = argparse.ArgumentParser(description="Gemma-3 CoT SFT + PPO with faithfulness reward (AFC + gated NLI + format + optional PRM)")
+
+    # PRM opts
     p.add_argument("--prm-base-id", type=str, default=None)
     p.add_argument("--prm-load-in-4bit", action="store_true", default=None)
     p.add_argument("--no-prm-load-in-4bit", dest="prm_load_in_4bit", action="store_false")
+
     # Toggles
     p.add_argument("--run-sft", action="store_true", default=None)
     p.add_argument("--no-run-sft", dest="run_sft", action="store_false")
@@ -572,7 +492,7 @@ def parse_args(argv: List[str]) -> Args:
     p.add_argument("--eval-every", type=int, default=None)
     p.add_argument("--eval-gsm8k-n", type=int, default=None)
     p.add_argument("--reward-w-prm", type=float, default=None)
-    p.add_argument("--reward-w-rule", type=float, default=None)
+    p.add_argument("--reward-w-rule", type=float, default=None)  # legacy; mapped to w_format
     p.add_argument("--reward-clip-min", type=float, default=None)
     p.add_argument("--reward-clip-max", type=float, default=None)
 
@@ -586,6 +506,17 @@ def parse_args(argv: List[str]) -> Args:
     # Precision
     p.add_argument("--precision", type=str, choices=["auto","bf16","fp16","fp32"], default=None)
 
+    # ===== New: Faithfulness knobs =====
+    p.add_argument("--reward-w-consistency", type=float, default=None)
+    p.add_argument("--reward-w-format", type=float, default=None)
+    p.add_argument("--reward-w-nli", type=float, default=None)
+    p.add_argument("--use-nli", action="store_true", default=None)
+    p.add_argument("--no-use-nli", dest="use_nli", action="store_false")
+    p.add_argument("--nli-model-id", type=str, default=None)
+    p.add_argument("--consistency-num-tol", type=float, default=None)
+    p.add_argument("--nli-dynamic-gate", action="store_true", default=None)
+    p.add_argument("--no-nli-dynamic-gate", dest="nli_dynamic_gate", action="store_false")
+
     ns = p.parse_args(argv)
     args = Args()
     for k, v in vars(ns).items():
@@ -593,10 +524,14 @@ def parse_args(argv: List[str]) -> Args:
             setattr(args, k, v)
     if args.kl_anneal != "none":
         args.ppo_target_kl = args.kl_max
+
+    # keep legacy mapping: --reward-w-rule == format weight unless explicitly overridden
+    if ns.reward_w_rule is not None and ns.reward_w_format is None:
+        args.reward_w_format = ns.reward_w_rule
+
     return args
 
 # ======================= Data =======================
-
 _SINGLE_ANGLE_OPEN = "‹"
 _SINGLE_ANGLE_CLOSE = "›"
 
@@ -606,10 +541,6 @@ def _normalize_angle_tags(text: str) -> str:
     return text.replace(_SINGLE_ANGLE_OPEN, "<").replace(_SINGLE_ANGLE_CLOSE, ">")
 
 def upcast_linear_inputs_to_weight_dtype(module: nn.Module) -> None:
-    """
-    Ensure every nn.Linear sees inputs in the same dtype as its weights.
-    This fixes Half (activations) vs Float (weights) mismatches from Unsloth's fp16 paths.
-    """
     if module is None:
         return
     for m in module.modules():
@@ -701,8 +632,7 @@ def build_sft_dataset(args: Args) -> Dataset:
     print(f"[DATA] total samples: {len(ds)}")
     return ds
 
-# ======================= Tokenizer =======================
-
+# ======================= Tokenizer & collators =======================
 def prepare_tokenizer(path_or_id: str, left_pad: bool = False) -> AutoTokenizer:
     tok = AutoTokenizer.from_pretrained(path_or_id, use_fast=True)
     tok.add_special_tokens({"additional_special_tokens": ["<think>", "</think>"]})
@@ -720,19 +650,10 @@ def prepare_tokenizer(path_or_id: str, left_pad: bool = False) -> AutoTokenizer:
         tok.truncation_side = 'left'
     return tok
 
-# ======================= Collator & packing =======================
 def make_ppo_query_collator(tokenizer: AutoTokenizer, max_len: int):
-    """
-    Collate raw rows like {"prompt": "...", "response": "..."} into
-    {"input_ids": ..., "attention_mask": ...} for PPOTrainer.
-    Only the prompt is encoded; responses are generated by the policy.
-    """
-    # ensure left pad for generation stability
     tokenizer.padding_side = "left"
     tokenizer.truncation_side = "left"
-
     def collate(batch):
-        # be tolerant to different field names
         prompts = []
         for b in batch:
             p = b.get("prompt") or b.get("query") or b.get("question") or ""
@@ -783,9 +704,7 @@ def greedy_pack_examples(texts: List[str], tokenizer: AutoTokenizer, max_len: in
     return packed
 
 # ======================= SFT =======================
-
 def _dtype_for_model(model_id: str, pc: PrecisionCfg) -> torch.dtype:
-    # Gemma-3 has issues with pure fp16 — prefer bf16 if available, else fp32.
     if _is_gemma3(model_id) and pc.model_dtype == torch.float16:
         return torch.float32
     return pc.model_dtype
@@ -793,20 +712,15 @@ def _dtype_for_model(model_id: str, pc: PrecisionCfg) -> torch.dtype:
 def sft_train(args: Args, pc: PrecisionCfg) -> str:
     from unsloth import FastLanguageModel
     set_seed(args.seed)
-
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # IMPORTANT:
-    # unsloth disallows dtype=torch.float32. On pre-Ampere with Gemma-3 our precision chooser
-    # will select fp32; in that case we hand unsloth dtype=None so it can choose internally,
-    # while we still quantize to 4-bit with fp16 compute.
     desired_dtype = _dtype_for_model(args.base_model_id, pc)
     dtype_for_unsloth: Optional[torch.dtype] = None if desired_dtype == torch.float32 else desired_dtype
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.base_model_id,
         max_seq_length=args.max_seq_len,
-        dtype=dtype_for_unsloth,      # None on T4+Gemma3 to avoid AssertionError
+        dtype=dtype_for_unsloth,
         load_in_4bit=args.load_in_4bit,
     )
     tokenizer.add_special_tokens({"additional_special_tokens": ["<think>", "</think>"]})
@@ -859,17 +773,13 @@ def sft_train(args: Args, pc: PrecisionCfg) -> str:
     )
 
     trainer.train()
-    model.save_pretrained(args.lora_ckpt_dir)  # adapters only
+    model.save_pretrained(args.lora_ckpt_dir)
     tokenizer.save_pretrained(args.lora_ckpt_dir)
     torch.cuda.empty_cache()
     return args.lora_ckpt_dir
 
 # ======================= Reward (VersaPRM) =======================
-
 class VersaPRM:
-    """
-    VersaPRM scoring helper.
-    """
     def __init__(
         self,
         model_id: str,
@@ -912,12 +822,7 @@ class VersaPRM:
             if quant_cfg is not None:
                 base_kwargs["quantization_config"] = quant_cfg
             base = AutoModelForCausalLM.from_pretrained(base_model_id, **base_kwargs)
-
-            self.model = PeftModel.from_pretrained(
-                base,
-                model_id,
-                is_trainable=False,
-            )
+            self.model = PeftModel.from_pretrained(base, model_id, is_trainable=False)
         else:
             full_kwargs: Dict[str, Any] = dict(
                 torch_dtype=prm_dtype,
@@ -929,12 +834,11 @@ class VersaPRM:
             self.model = AutoModelForCausalLM.from_pretrained(model_id, **full_kwargs)
 
         self.model.eval()
-
         self.step_delim = step_delim
         self.step_ids = self.tok.encode(self.step_delim, add_special_tokens=False)
         self.candidate_ids = self._resolve_candidate_ids(
             correct_label_candidates, incorrect_label_candidates
-        )  # order: [INCORRECT, CORRECT]
+        )
 
     def _pick_single_token_id(self, candidates) -> Optional[int]:
         for s in candidates:
@@ -997,117 +901,293 @@ def extract_think(text: str) -> str:
     m = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
     return m.group(1).strip() if m else text
 
-def _fully_disable_gc(model) -> None:
-    """
-    fully disable gradient checkpointing on a (wrapped) hf/trl/peft model.
-    unsloth's compiled gemma3 layers don't carry HF's _gradient_checkpointing_func,
-    so we also install a no-op just in case something toggles it later.
-    """
-    if model is None:
-        return
-    # top-level flags
-    for m in (model, getattr(model, "pretrained_model", None)):
-        if m is None:
-            continue
-        # config flag off
-        try:
-            m.config.gradient_checkpointing = False
-        except Exception:
-            pass
-        # api off
-        try:
-            m.gradient_checkpointing_disable()
-        except Exception:
-            pass
+# ======================= Faithful Reasoning Reward =======================
+# Local final-answer extractor (more robust for code)
+def _extract_final_answer_from_tail(tail: str) -> str:
+    s = tail.strip()
+    if not s:
+        return ""
+    # prefer fenced code if present
+    m = re.search(r"```(?:[a-zA-Z0-9_+-]*)\n(.*?)```", s, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    # common labels
+    for pat in [r"(?i)(?:final answer|answer|thus|therefore)\s*:\s*(.*)$"]:
+        m = re.search(pat, s, re.DOTALL)
+        if m:
+            return m.group(1).strip()
+    # ### pattern
+    m = re.search(r"####\s*(.*)$", s, re.MULTILINE)
+    if m:
+        return m.group(1).strip()
+    # fallback: last non-empty paragraph
+    parts = [p.strip() for p in s.split("\n\n") if p.strip()]
+    if parts:
+        return parts[-1]
+    # absolute fallback: last non-empty line
+    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+    return lines[-1] if lines else ""
 
-    # module-level guards
-    backbone = getattr(model, "pretrained_model", model)
+_NUM_RE = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
+
+def _to_float(s: str) -> Optional[float]:
     try:
-        for mod in backbone.modules():
-            if hasattr(mod, "gradient_checkpointing"):
-                try:
-                    mod.gradient_checkpointing = False
-                except Exception:
-                    pass
-            if not hasattr(mod, "_gradient_checkpointing_func"):
-                # no-op: simply call the wrapped function (no checkpointing)
-                setattr(mod, "_gradient_checkpointing_func",
-                        lambda f, *a, **k: f(*a, **k))
+        return float(s.replace(",", ""))
     except Exception:
-        pass
+        return None
 
+def _extract_last_number(text: str) -> Optional[float]:
+    nums = _NUM_RE.findall(text or "")
+    if not nums:
+        return None
+    try:
+        return float(nums[-1].replace(",", ""))
+    except Exception:
+        return None
 
-# ====== NEW: composite reward module to plug into PPO ======
-class CompositeRewardModel(nn.Module):
+def _normalize_text(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").lower()).strip()
+
+def _answer_type(final_answer: str, prompt: str) -> str:
+    a = (final_answer or "").strip()
+    if not a:
+        return "empty"
+    na = _normalize_text(a)
+    if na in {"yes","no","true","false"}:
+        return "bool"
+    if re.search(r"\b[A-D]\)\s", prompt) or re.search(r"\b[A-D]\.\s", prompt):
+        if re.fullmatch(r"[A-Da-d]", a.strip()):
+            return "mc_letter"
+    if _to_float(a) is not None:
+        return "numeric"
+    # If it's very long (> 300 chars), treat as freeform/code
+    if len(a) >= 300 or "```" in a:
+        return "freeform"
+    return "string"
+
+def _tokenize_text_simple(s: str) -> List[str]:
+    return re.findall(r"[a-zA-Z0-9_]+", (s or "").lower())
+
+def _coverage_and_tail_overlap(chain: str, final_answer: str) -> float:
     """
-    Minimal reward 'model' for new TRL PPO: returns a (batch, 1) logits tensor.
-    Internally uses your VersaPRM + rule_safety_reward. No gradients.
+    For free-text/code answers: reward when final answer is derivable from chain.
+    - content-word coverage
+    - tail overlap (last ~600 chars of chain)
     """
-    def __init__(self, tok, prm, w_prm: float = 1.0, w_rule: float = 0.2):
+    ch = (chain or "")
+    fa = (final_answer or "")
+    if not ch or not fa:
+        return 0.0
+    ch_norm = _normalize_text(ch)
+    tail = ch_norm[-800:]
+
+    # content tokens from final (len >= 4)
+    f_toks = [w for w in _tokenize_text_simple(fa) if len(w) >= 4]
+    if not f_toks:
+        return 1.0 if _normalize_text(fa) in tail else 0.0
+
+    uniq = sorted(set(f_toks))
+    hits = sum(1 for w in uniq if w in ch_norm)
+    cov = hits / max(1, len(uniq))
+
+    # encourage explicit presence of the answer (or big chunks) near tail
+    near = 0.0
+    if _normalize_text(fa) in tail:
+        near = 1.0
+    else:
+        # n-gram-ish: check presence of long tokens in tail
+        long_hits = sum(1 for w in uniq if (len(w) >= 6 and w in tail))
+        near = min(1.0, long_hits / max(1, len([w for w in uniq if len(w) >= 6])))
+
+    # combine coverage and tail presence
+    return float(min(1.0, 0.6 * cov + 0.4 * near))
+
+def _format_reward(text: str,
+                   min_tokens: int = 12,
+                   max_tokens: int = 2048,
+                   max_repeat_ngram: int = 3) -> float:
+    if not text or not text.strip():
+        return -0.8
+    lo = text.find("<think>")
+    hi = text.find("</think>")
+    if lo == -1 and hi == -1:
+        return -1.0
+    if lo == -1 or hi == -1 or hi <= lo:
+        return -0.6
+    think_txt = text[lo + len("<think>"):hi]
+    toks = re.findall(r"\S+", think_txt)
+    T = len(toks)
+    score = 0.0
+    if min_tokens <= T <= max_tokens:
+        score += 0.4
+    elif T < min_tokens:
+        score -= 0.3
+    else:
+        score -= 0.15
+    def rep_count(n):
+        ngrams = [" ".join(toks[i:i+n]) for i in range(max(0, T-n+1))]
+        if not ngrams:
+            return 0
+        from collections import Counter
+        c = Counter(ngrams)
+        return sum(v for v in c.values() if v >= max_repeat_ngram)
+    score -= 0.15 * min(3, rep_count(2))
+    score -= 0.10 * min(3, rep_count(3))
+    if T > 0:
+        uniq = len(set(toks)) / max(1, T)
+        if uniq >= 0.35:
+            score += 0.15
+        elif uniq <= 0.15:
+            score -= 0.15
+    if re.search(r"<\s*(tool|function|call|api|request)\b", think_txt, re.I):
+        score -= 0.2
+    score += 0.2
+    return float(max(-1.0, min(1.0, score)))
+
+# Optional NLI
+class _Entailer:
+    def __init__(self, model_id: str, device: str = "cuda"):
+        from transformers import AutoTokenizer, AutoModelForSequenceClassification
+        self.tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+        self.model = AutoModelForSequenceClassification.from_pretrained(
+            model_id, torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        )
+        self.model.to(device)
+        self.model.eval()
+        self.device = device
+    @torch.no_grad()
+    def entail_prob(self, premise: str, hypothesis: str) -> float:
+        inputs = self.tok.encode_plus(premise, hypothesis, return_tensors="pt",
+                                      truncation=True, max_length=2048).to(self.device)
+        out = self.model(**inputs)
+        probs = torch.softmax(out.logits, dim=-1)[0]
+        return float(probs[-1].item())  # entailment
+
+def _nli_should_apply(prompt: str, chain: str, final: str) -> bool:
+    # Heuristics: turn off for code / very long open-ended answers
+    txt = (prompt + " " + chain + " " + final).lower()
+    if "```" in txt:
+        return False
+    if any(k in txt for k in ["def ", "class ", "import ", "#include", "public static", "fn ", "lambda ", "=>"]):
+        return False
+    if len(final) > 600:
+        return False
+    # If the answer is clearly numeric / MC / short QA, allow
+    return True
+
+class ReasoningFaithfulnessRewardModel(nn.Module):
+    def __init__(self,
+                 tok,
+                 prm=None,
+                 w_format: float = 0.2,
+                 w_consistency: float = 0.6,
+                 w_nli: float = 0.2,
+                 use_nli: bool = True,
+                 nli_model_id: str = "microsoft/deberta-base-mnli",
+                 num_tol: float = 1e-4,
+                 device: str = "cuda",
+                 dynamic_gate: bool = True):
         super().__init__()
         self.tok = tok
         self.prm = prm
-        self.w_prm = float(w_prm)
-        self.w_rule = float(w_rule)
+        self.w_format = float(w_format)
+        self.w_consistency = float(w_consistency)
+        self.w_nli = float(w_nli) if use_nli else 0.0
+        self.num_tol = float(num_tol)
+        self.dynamic_gate = bool(dynamic_gate)
+
+        self.entailer = None
+        if use_nli and self.w_nli > 0.0:
+            try:
+                self.entailer = _Entailer(nli_model_id, device=device)
+            except Exception:
+                self.entailer = None
+                self.w_nli = 0.0
 
     @torch.no_grad()
     def forward(self, input_ids=None, attention_mask=None, **kwargs):
         device = input_ids.device
         texts = self.tok.batch_decode(input_ids, skip_special_tokens=False)
-        rewards = []
+        rewards: List[float] = []
+
         for text in texts:
-            # heuristically split: everything before first <think> is the 'question'
-            q = text.split("<think>")[0].strip()
+            prompt = text.split("<think>")[0].strip()
             chain = extract_think(text)
-            prm_score = self.prm.score(q, chain)
-            rule_score = rule_safety_reward(q, text)
-            r = max(-1.0, min(1.0, self.w_prm * prm_score + self.w_rule * rule_score))
-            rewards.append(r)
+            tail = text.split("</think>")[-1] if "</think>" in text else text
+            final = _extract_final_answer_from_tail(tail)
+
+            # 1) format
+            r_fmt = _format_reward(text)  # [-1,1] -> later mapped to [0,1]
+
+            # 2) AFC consistency
+            t = _answer_type(final, prompt)
+            if t == "numeric":
+                fa = _to_float(final)
+                lc = _extract_last_number(chain)
+                if fa is None or lc is None:
+                    r_afc = 0.0
+                else:
+                    denom = max(1.0, abs(fa))
+                    ok = abs(fa - lc) <= max(self.num_tol, 1e-6 * denom)
+                    r_afc = 1.0 if ok else 0.0
+            elif t == "mc_letter":
+                ch_norm = _normalize_text(chain)
+                tail_norm = ch_norm[-600:]
+                ans_norm = _normalize_text(final)
+                if re.search(rf"(answer|thus|therefore|so)\s*(is|:)?\s*{ans_norm}\b", tail_norm):
+                    r_afc = 1.0
+                else:
+                    r_afc = 0.6 if re.search(rf"\b{ans_norm}\b", ch_norm) else 0.0
+            elif t == "bool":
+                ch_norm = _normalize_text(chain)
+                ans_norm = _normalize_text(final)
+                tail_norm = ch_norm[-400:]
+                if any(w in tail_norm for w in ["therefore", "so", "hence", "conclude"]) and re.search(rf"\b{ans_norm}\b", tail_norm):
+                    r_afc = 1.0
+                else:
+                    r_afc = 0.6 if re.search(rf"\b{ans_norm}\b", ch_norm) else 0.0
+            elif t in ("freeform", "string"):
+                r_afc = _coverage_and_tail_overlap(chain, final)
+            else:
+                r_afc = 0.0
+
+            # 3) NLI entailment (auto gated)
+            r_nli = 0.0
+            if self.entailer is not None and chain and final and self.w_nli > 0.0:
+                if (not self.dynamic_gate) or _nli_should_apply(prompt, chain, final):
+                    hyp = f"The answer is {final}."
+                    try:
+                        r_nli = self.entailer.entail_prob(chain, hyp)  # 0..1
+                    except Exception:
+                        r_nli = 0.0
+
+            # 4) PRM step quality (small additive)
+            r_prm = 0.0
+            if self.prm is not None:
+                try:
+                    r_prm = float(self.prm.score(prompt, chain))  # 0..1
+                except Exception:
+                    r_prm = 0.0
+
+            raw = (self.w_format * (0.5 + 0.5 * r_fmt) +
+                   self.w_consistency * r_afc +
+                   self.w_nli * r_nli +
+                   max(0.0, 0.3 * r_prm))
+
+            centered = (raw - 0.5) * 2.0
+            centered = max(-1.0, min(1.0, centered))
+            rewards.append(float(centered))
+
         logits = torch.tensor(rewards, dtype=torch.float32, device=device).unsqueeze(-1)
         return SequenceClassifierOutput(logits=logits)
 
-# ======================= Rule/Safety Critic =======================
-
-BAD_PHRASES = [
-    "I can't help with that", "I'm unable to", "I cannot assist", "as an AI",
-    "I'm just an AI", "sorry, I can't", "I'm sorry, I can't", "cannot comply"
-]
-
-def rule_safety_reward(prompt: str, output: str) -> float:
-    if not output or not output.strip():
-        return -0.5
-    tail = output.split("</think>")[-1] if "</think>" in output else output
-    tail = tail.strip()
-    if any(p.lower() in output.lower() for p in BAD_PHRASES):
-        return -0.5
-    tok_est = len(re.findall(r"\S+", tail))
-    len_score = 0.0
-    if 1 <= tok_est <= 200:
-        len_score = 0.2
-    elif tok_est > 500:
-        len_score = -0.2
-    reps = sum(1 for m in re.finditer(r"(\b\w+\b)(?:\s+\1){3,}", tail, re.IGNORECASE))
-    rep_score = -0.2 * min(reps, 3)
-    has_number = bool(re.search(r"[-+]?\d[\d,\.]*", tail))
-    fa_score = 0.1 if has_number else 0.0
-    tool_like = bool(re.search(r"<\s*(tool|function|call)[^>]*>", tail, re.IGNORECASE))
-    tool_pen = -0.2 if tool_like else 0.0
-    score = len_score + rep_score + fa_score + tool_pen
-    return float(max(-1.0, min(1.0, score)))
-
-# ======================= PPO (LoRA-only training) =======================
+# ======================= PPO policy build =======================
 from importlib import reload
 import transformers.models.gemma3.modeling_gemma3 as _gemma3
 reload(_gemma3)
 
 def build_ppo_policy_with_lora(args: Args, pc: PrecisionCfg) -> Tuple[AutoModelForCausalLMWithValueHead, AutoTokenizer]:
-    """
-    Gemma-3 + T4 + Unsloth: keep PPO policy in full fp32.
-    Avoid 4-bit here to prevent Half/Float matmul mismatches inside Unsloth-patched layers.
-    """
     is_gemma3 = _is_gemma3(args.base_model_id)
-
-    # --- tokenizer (left-pad for generation/RL) ---
     tok = AutoTokenizer.from_pretrained(args.lora_ckpt_dir, use_fast=True)
     if tok.eos_token is None:
         if tok.sep_token is not None:
@@ -1119,7 +1199,6 @@ def build_ppo_policy_with_lora(args: Args, pc: PrecisionCfg) -> Tuple[AutoModelF
     tok.padding_side = "left"
     tok.truncation_side = "left"
 
-    # --- model load: force fp32 for Gemma-3; NO 4-bit on Gemma-3 ---
     compute_dtype = _dtype_for_model(args.base_model_id, pc)
     model_kwargs: Dict[str, Any] = dict(
         torch_dtype=torch.float32 if is_gemma3 else compute_dtype,
@@ -1139,35 +1218,29 @@ def build_ppo_policy_with_lora(args: Args, pc: PrecisionCfg) -> Tuple[AutoModelF
         **model_kwargs,
     )
 
-    # Make sure vocab matches LoRA tokenizer size
     new_vocab = len(tok)
     base_vocab = policy.pretrained_model.get_input_embeddings().weight.shape[0]
     if new_vocab != base_vocab:
         policy.pretrained_model.resize_token_embeddings(new_vocab)
 
-    # --- attach LoRA adapters (trainable) ---
     policy.pretrained_model = PeftModel.from_pretrained(
         policy.pretrained_model,
         args.lora_ckpt_dir,
         is_trainable=True,
     )
 
-    # make matmul dtypes consistent for all Linear ops
     upcast_linear_inputs_to_weight_dtype(policy.pretrained_model)
 
     if is_gemma3:
-        # unify everything to fp32 (backbone + LoRA + v_head)
         policy.pretrained_model.to(dtype=torch.float32)
         policy.v_head.to(dtype=torch.float32)
 
-    # freeze all, then unfreeze LoRA and v_head
     for n, p in policy.named_parameters():
         p.requires_grad = False
     for n, p in policy.named_parameters():
         if "lora_" in n or n.startswith("v_head"):
             p.requires_grad = True
 
-    # ids / cache settings
     policy.config.pad_token_id = tok.pad_token_id
     policy.config.eos_token_id = tok.eos_token_id
     if hasattr(policy, "pretrained_model") and hasattr(policy.pretrained_model, "config"):
@@ -1177,13 +1250,11 @@ def build_ppo_policy_with_lora(args: Args, pc: PrecisionCfg) -> Tuple[AutoModelF
     if hasattr(policy, "pretrained_model") and hasattr(policy.pretrained_model, "config"):
         policy.pretrained_model.config.use_cache = False
 
-    # keep TRL >=0.21 happy
     _fix_trl_valuehead_base_prefix(policy)
 
-    # >>> CRUCIAL: fully disable gradient checkpointing for PPO <<<
+    # Disable grad checkpointing everywhere
     _fully_disable_gc(policy)
 
-    # explicitly mark forwards & generate as no-dynamo (decorator style)
     try:
         import torch._dynamo as dynamo
         if hasattr(policy, "forward"):
@@ -1197,7 +1268,35 @@ def build_ppo_policy_with_lora(args: Args, pc: PrecisionCfg) -> Tuple[AutoModelF
 
     return policy, tok
 
+def _fully_disable_gc(model) -> None:
+    if model is None:
+        return
+    for m in (model, getattr(model, "pretrained_model", None)):
+        if m is None:
+            continue
+        try:
+            m.config.gradient_checkpointing = False
+        except Exception:
+            pass
+        try:
+            m.gradient_checkpointing_disable()
+        except Exception:
+            pass
+    backbone = getattr(model, "pretrained_model", model)
+    try:
+        for mod in backbone.modules():
+            if hasattr(mod, "gradient_checkpointing"):
+                try:
+                    mod.gradient_checkpointing = False
+                except Exception:
+                    pass
+            if not hasattr(mod, "_gradient_checkpointing_func"):
+                setattr(mod, "_gradient_checkpointing_func",
+                        lambda f, *a, **k: f(*a, **k))
+    except Exception:
+        pass
 
+# ======================= PPO loop =======================
 def anneal_target_kl(kind: str, epoch_idx: int, total_epochs: int, kl_min: float, kl_max: float) -> float:
     if kind == "none" or total_epochs <= 1:
         return kl_max
@@ -1225,7 +1324,6 @@ def evaluate_gsm8k_em(model: AutoModelForCausalLM, tok: AutoTokenizer, n: int = 
         ref = load_dataset("openai/gsm8k", "main", split="test")
     except Exception:
         return {"em": None, "n": 0}
-
     ref = ref.select(range(min(n, len(ref))))
     correct = 0
     total = len(ref)
@@ -1251,10 +1349,8 @@ def ppo_train(args: Args, sft_dataset: Dataset, pc: PrecisionCfg):
     ref_model = None if args.ref_free else create_reference_model(policy)
     if ref_model is not None:
         _fix_trl_valuehead_base_prefix(ref_model)
-        _fully_disable_gc(ref_model)   # <<< add this
-        upcast_linear_inputs_to_weight_dtype(
-        getattr(ref_model, "pretrained_model", ref_model)
-        )
+        _fully_disable_gc(ref_model)
+        upcast_linear_inputs_to_weight_dtype(getattr(ref_model, "pretrained_model", ref_model))
         try:
             import torch._dynamo as dynamo
             if hasattr(ref_model, "forward"):
@@ -1268,17 +1364,28 @@ def ppo_train(args: Args, sft_dataset: Dataset, pc: PrecisionCfg):
 
     ensure_generation_config(policy, tok)
 
-    # build PRM + composite reward
+    # ---- Reward wiring ----
     prm = VersaPRM(
         args.reward_model_id,
         device=args.device,
         load_in_4bit=args.prm_load_in_4bit,
         base_model_id=args.prm_base_id,
         prm_compute_dtype=pc.bnb_compute_dtype if args.prm_load_in_4bit else (torch.bfloat16 if _is_bf16_supported() else torch.float16),
-    )
-    rm = CompositeRewardModel(tok, prm, w_prm=args.reward_w_prm, w_rule=args.reward_w_rule)
+    ) if (args.reward_w_prm != 0.0) else None
 
-    # >>> NEW: collator for PPO dataset (encodes only the prompt) <<<
+    rm = ReasoningFaithfulnessRewardModel(
+        tok,
+        prm=prm,
+        w_format=args.reward_w_format,
+        w_consistency=args.reward_w_consistency,
+        w_nli=args.reward_w_nli,
+        use_nli=args.use_nli,
+        nli_model_id=args.nli_model_id,
+        num_tol=args.consistency_num_tol,
+        device=args.device if torch.cuda.is_available() else "cpu",
+        dynamic_gate=args.nli_dynamic_gate,
+    )
+
     ppo_collator = make_ppo_query_collator(tok, args.max_seq_len)
 
     cfg = PPOConfig(
@@ -1291,30 +1398,26 @@ def ppo_train(args: Args, sft_dataset: Dataset, pc: PrecisionCfg):
         fp16=pc.trainer_fp16,
     )
 
-    # pass the collator to the version-flexible constructor
     trainer = make_ppo_trainer(
         cfg, policy, ref_model, tok,
         train_dataset=sft_dataset,
-        data_collator=ppo_collator,            # <<< this fixes the crash
+        data_collator=ppo_collator,
         reward_model=rm
     )
 
     m = getattr(trainer, "model", None)
     if m is not None and not hasattr(m, "generate"):
-        # TRL's wrapper usually exposes .policy_model (or .actor_model) which *does* have .generate
         policy_like = getattr(m, "policy_model", None) or getattr(m, "actor_model", None)
         if policy_like is not None and hasattr(policy_like, "generate"):
             def _delegate_generate(*args, _m=m, **kwargs):
                 tgt = getattr(_m, "policy_model", None) or getattr(_m, "actor_model", None)
                 return tgt.generate(*args, **kwargs)
             setattr(m, "generate", _delegate_generate)
-
-            # be nice and mirror gen/config too so any other utils don't choke
             if not hasattr(m, "generation_config") and hasattr(policy_like, "generation_config"):
                 m.generation_config = policy_like.generation_config
             if not hasattr(m, "config") and hasattr(policy_like, "config"):
                 m.config = policy_like.config
-            
+
     trainer.train()
 
     os.makedirs(args.ppo_lora_dir, exist_ok=True)
@@ -1331,9 +1434,7 @@ def ppo_train(args: Args, sft_dataset: Dataset, pc: PrecisionCfg):
     except Exception:
         pass
 
-
 # ======================= Merge after PPO =======================
-
 def merge_after_ppo(args: Args, pc: PrecisionCfg) -> str:
     print("[MERGE] Loading base and PPO LoRA for final merge...")
     dtype_for_merge = _dtype_for_model(args.base_model_id, pc)
@@ -1357,7 +1458,6 @@ def merge_after_ppo(args: Args, pc: PrecisionCfg) -> str:
     return args.merged_path
 
 # ======================= Manifest =======================
-
 def library_versions() -> Dict[str, Any]:
     import transformers, datasets as hf_datasets, trl as trl_lib
     try:
@@ -1413,7 +1513,6 @@ def write_manifest(args: Args, pc: PrecisionCfg, stage: str, extra: Dict[str, An
     print(f"[MANIFEST] wrote {path}")
 
 # ======================= Main =======================
-
 def main(argv: List[str]):
     args = parse_args(argv)
     set_seed(args.seed)
@@ -1421,11 +1520,10 @@ def main(argv: List[str]):
 
     pc = choose_precision(args.precision, args.base_model_id)
     _print_precision_banner(pc)
-
     write_manifest(args, pc, stage="start", extra={})
 
     if args.run_sft:
-        sft_dir = sft_train(args, pc)  # saves adapters to lora_ckpt_dir
+        sft_dir = sft_train(args, pc)
         write_manifest(args, pc, stage="post_sft", extra={"sft_lora_dir": sft_dir})
     else:
         print("[INFO] Skipping SFT; expecting existing adapters in --lora-ckpt-dir")

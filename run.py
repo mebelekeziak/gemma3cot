@@ -418,6 +418,14 @@ class Args:
     consistency_num_tol: float = 1e-4   # numeric tolerance for AFC
     nli_dynamic_gate: bool = True       # auto-disable NLI for open-ended/code/writing
 
+    # ===== New: length prior + compression knobs =====
+    len_prior_mu_easy: int = 40         # target think length (tokens) for easy prompts
+    len_prior_mu_hard: int = 220        # target think length for hard prompts
+    len_prior_sigma: float = 0.8        # log-normal width
+    len_prior_w: float = 0.25           # weight of length prior in format reward
+    compression_w: float = 0.15         # weight for 1–2 sentence explanation tie-back
+    compression_max_chars: int = 320    # only look at this many chars after </think> for tie-back
+
 def parse_args(argv: List[str]) -> Args:
     import argparse
     p = argparse.ArgumentParser(description="Gemma-3 CoT SFT + PPO with faithfulness reward (AFC + gated NLI + format + optional PRM)")
@@ -517,11 +525,19 @@ def parse_args(argv: List[str]) -> Args:
     p.add_argument("--nli-dynamic-gate", action="store_true", default=None)
     p.add_argument("--no-nli-dynamic-gate", dest="nli_dynamic_gate", action="store_false")
 
+    # ===== New: length prior + compression CLI =====
+    p.add_argument("--len-prior-mu-easy", type=int, default=None)
+    p.add_argument("--len-prior-mu-hard", type=int, default=None)
+    p.add_argument("--len-prior-sigma", type=float, default=None)
+    p.add_argument("--len-prior-w", type=float, default=None)
+    p.add_argument("--compression-w", type=float, default=None)
+    p.add_argument("--compression-max-chars", type=int, default=None)
+
     ns = p.parse_args(argv)
     args = Args()
     for k, v in vars(ns).items():
         if v is not None:
-            setattr(args, k, v)
+            setattr(args, k.replace("-", "_"), v)
     if args.kl_anneal != "none":
         args.ppo_target_kl = args.kl_max
 
@@ -580,7 +596,7 @@ def load_and_prepare_gsm8k() -> Dataset:
             q = next((m.get("content","") for m in msgs if m.get("role")=="user"), "").strip()
         cot_parts = []
         for tag in ["thinking","reasoning","reflection","adjustment"]:
-            m = re.search(fr"<{tag}>(.*?)</{tag}>", gen, re.DOTALL)
+            m = re.search(r"<{tag}>(.*?)</{tag}>".format(tag=tag), gen, re.DOTALL)
             if m:
                 cot_parts.append(m.group(1).strip())
         chain = "\n\n".join([p for p in cot_parts if p])
@@ -968,6 +984,22 @@ def _answer_type(final_answer: str, prompt: str) -> str:
 def _tokenize_text_simple(s: str) -> List[str]:
     return re.findall(r"[a-zA-Z0-9_]+", (s or "").lower())
 
+def _difficulty_score(prompt: str) -> float:
+    """
+    Crude 0..1 difficulty proxy to set the chain-length prior.
+    Uses prompt length, presence of digits/operators, and a few math/physics keywords.
+    """
+    p = prompt or ""
+    tokens = len(re.findall(r"\S+", p))
+    digits = sum(ch.isdigit() for ch in p)
+    eq = len(re.findall(r"[=+\-*/^]", p))
+    flags = 0
+    for k in ["prove", "derive", "integral", "limit", "matrix", "vector",
+              "physics", "acceleration", "force", "charge", "momentum"]:
+        flags += int(k in p.lower())
+    s = 0.4 * min(1.0, tokens/120) + 0.3 * min(1.0, (digits+eq)/30) + 0.3 * min(1.0, flags/4)
+    return max(0.0, min(1.0, s))
+
 def _coverage_and_tail_overlap(chain: str, final_answer: str) -> float:
     """
     For free-text/code answers: reward when final answer is derivable from chain.
@@ -1002,28 +1034,42 @@ def _coverage_and_tail_overlap(chain: str, final_answer: str) -> float:
     # combine coverage and tail presence
     return float(min(1.0, 0.6 * cov + 0.4 * near))
 
+def _roleplay_or_creative(prompt: str) -> bool:
+    """Detect RP/story/creative prompts where we want short planning and no entailment checks."""
+    txt = (prompt or "").lower()
+    return any(k in txt for k in [
+        "roleplay", "in character", "write a story", "story about", "narrate",
+        "poem", "song", "lyrics", "script", "as a ", "you are "
+    ])
+
 def _format_reward(text: str,
-                   min_tokens: int = 12,
-                   max_tokens: int = 2048,
-                   max_repeat_ngram: int = 3) -> float:
+                   min_tokens: int = 8,
+                   max_tokens: int = 4096,
+                   max_repeat_ngram: int = 3,
+                   prompt: str = "",
+                   args: Optional[Args] = None) -> float:
+    """
+    Format/anti-spam + difficulty-aware length prior + explanation compression tie-back.
+    Returns roughly in [-1, 1].
+    """
     if not text or not text.strip():
         return -0.8
     lo = text.find("<think>")
     hi = text.find("</think>")
-    if lo == -1 and hi == -1:
-        return -1.0
     if lo == -1 or hi == -1 or hi <= lo:
         return -0.6
     think_txt = text[lo + len("<think>"):hi]
     toks = re.findall(r"\S+", think_txt)
     T = len(toks)
-    score = 0.0
-    if min_tokens <= T <= max_tokens:
-        score += 0.4
-    elif T < min_tokens:
-        score -= 0.3
-    else:
-        score -= 0.15
+    if T == 0:
+        return -0.5
+
+    # Base anti-spam (NRP + diversity)
+    score = 0.2
+    if T < min_tokens:
+        score -= 0.2
+    if T > max_tokens:
+        score -= 0.2
     def rep_count(n):
         ngrams = [" ".join(toks[i:i+n]) for i in range(max(0, T-n+1))]
         if not ngrams:
@@ -1031,17 +1077,45 @@ def _format_reward(text: str,
         from collections import Counter
         c = Counter(ngrams)
         return sum(v for v in c.values() if v >= max_repeat_ngram)
-    score -= 0.15 * min(3, rep_count(2))
-    score -= 0.10 * min(3, rep_count(3))
-    if T > 0:
-        uniq = len(set(toks)) / max(1, T)
-        if uniq >= 0.35:
-            score += 0.15
-        elif uniq <= 0.15:
-            score -= 0.15
+    score -= 0.12 * min(3, rep_count(2))
+    score -= 0.08 * min(3, rep_count(3))
+    uniq = len(set(toks)) / max(1, T)
+    if uniq >= 0.35: score += 0.12
+    elif uniq <= 0.15: score -= 0.12
     if re.search(r"<\s*(tool|function|call|api|request)\b", think_txt, re.I):
         score -= 0.2
-    score += 0.2
+
+    # Difficulty-aware length prior (log-normal over token count)
+    if args is not None:
+        if _roleplay_or_creative(prompt):
+            mu = 24
+        else:
+            d = _difficulty_score(prompt)  # 0..1
+            mu = getattr(args, "len_prior_mu_easy", 40) + d * (
+                getattr(args, "len_prior_mu_hard", 220) - getattr(args, "len_prior_mu_easy", 40)
+            )
+        sigma = getattr(args, "len_prior_sigma", 0.8)
+        w = getattr(args, "len_prior_w", 0.25)
+        if T > 0:
+            z = (math.log(max(1, T)) - math.log(max(1.0, mu))) / max(1e-6, sigma)
+            prior = math.exp(-0.5 * z * z)
+            prior = max(0.0, min(1.0, prior))
+            score += w * (prior - 0.5)
+
+    # Compression tie-back: short “why” near the end should reuse tail-of-chain tokens
+    if args is not None:
+        w_c = getattr(args, "compression_w", 0.15)
+        tail = text.split("</think>")[-1] if "</think>" in text else text
+        tail = (tail or "").strip()[: getattr(args, "compression_max_chars", 320)]
+        ch_norm = _normalize_text(think_txt)[-800:]
+        exp_norm = _normalize_text(tail)
+        if exp_norm:
+            toks_f = [w for w in _tokenize_text_simple(exp_norm) if len(w) >= 4]
+            uniq_f = sorted(set(toks_f))
+            hits = sum(1 for w in uniq_f if w in ch_norm)
+            cov = hits / max(1, len(uniq_f))
+            score += w_c * (cov - 0.5)
+
     return float(max(-1.0, min(1.0, score)))
 
 # Optional NLI
@@ -1116,8 +1190,8 @@ class ReasoningFaithfulnessRewardModel(nn.Module):
             tail = text.split("</think>")[-1] if "</think>" in text else text
             final = _extract_final_answer_from_tail(tail)
 
-            # 1) format
-            r_fmt = _format_reward(text)  # [-1,1] -> later mapped to [0,1]
+            # 1) format (+ length prior + compression tie-back)
+            r_fmt = _format_reward(text, prompt=prompt, args=getattr(self, "_args", None))  # [-1,1]
 
             # 2) AFC consistency
             t = _answer_type(final, prompt)
@@ -1385,6 +1459,8 @@ def ppo_train(args: Args, sft_dataset: Dataset, pc: PrecisionCfg):
         device=args.device if torch.cuda.is_available() else "cpu",
         dynamic_gate=args.nli_dynamic_gate,
     )
+    # pass Args to RM for length prior & compression
+    rm._args = args
 
     ppo_collator = make_ppo_query_collator(tok, args.max_seq_len)
 
@@ -1511,6 +1587,42 @@ def write_manifest(args: Args, pc: PrecisionCfg, stage: str, extra: Dict[str, An
     with open(path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     print(f"[MANIFEST] wrote {path}")
+
+# ======================= Inference: Budgeted Reasoning Controller =======================
+def budgeted_generate(model, tok, prompt: str,
+                      budgets=(64, 160, 320, 640),
+                      temperature: float = 0.7,
+                      top_p: float = 0.9):
+    """
+    Budgeted Reasoning Controller: escalate think budget only if needed.
+    For creative prompts we return on first pass (short plan).
+    """
+    device = next(model.parameters()).device
+    for b in budgets:
+        enc = tok([prompt], return_tensors="pt").to(device)
+        with torch.no_grad():
+            out = model.generate(**enc,
+                                 max_new_tokens=b,
+                                 do_sample=True,
+                                 temperature=temperature,
+                                 top_p=top_p,
+                                 eos_token_id=tok.eos_token_id,
+                                 pad_token_id=tok.pad_token_id)
+        text = tok.decode(out[0], skip_special_tokens=True)
+        # Minimal AFC-based confidence check
+        chain = extract_think(text)
+        final = _extract_final_answer_from_tail(text.split("</think>")[-1] if "</think>" in text else text)
+        ok = False
+        if final:
+            t = _answer_type(final, prompt)
+            if t == "numeric":
+                fa = _to_float(final); lc = _extract_last_number(chain)
+                ok = (fa is not None and lc is not None and abs(fa - lc) <= max(1e-4, 1e-6*max(1.0, abs(fa))))
+            else:
+                ok = _coverage_and_tail_overlap(chain, final) >= 0.5
+        if ok or _roleplay_or_creative(prompt):
+            return text
+    return text
 
 # ======================= Main =======================
 def main(argv: List[str]):

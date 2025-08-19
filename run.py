@@ -14,17 +14,14 @@ from packaging.version import parse as V
 import trl as trl_lib
 # 👇 place this right after "import trl as trl_lib"
 import trl.trainer.utils as _trl_utils
-
-if not getattr(_trl_utils, "_safe_generate_patched", False):
-    _orig_generate = _trl_utils.generate
-
-    def _safe_generate(*args, **kwargs):
-        with no_dynamo():                 # hard-stop any Dynamo compile of the gen path
-            return _orig_generate(*args, **kwargs)
-
-    _trl_utils.generate = _safe_generate
-    _trl_utils._safe_generate_patched = True
-    print("[PATCH] TRL utils.generate wrapped with no_dynamo()")
+try:
+    import torch._dynamo as dynamo
+    if not getattr(_trl_utils, "_safe_generate_patched", False):
+        _trl_utils.generate = dynamo.disable(_trl_utils.generate)  # decorator-style
+        _trl_utils._safe_generate_patched = True
+        print("[PATCH] TRL utils.generate disabled via torch._dynamo.disable (decorator)")
+except Exception as e:
+    print(f"[WARN] Could not disable TRL utils.generate via Dynamo: {e}")
 import numpy as np
 import torch
 import torch.nn as nn
@@ -52,11 +49,9 @@ from contextlib import contextmanager
 from contextlib import nullcontext
 
 def no_dynamo():
-    try:
-        import torch._dynamo as dynamo
-        return dynamo.disable()   # real context manager in PyTorch 2.x
-    except Exception:
-        return nullcontext()
+    # Torch 2.8: dynamo.disable is decorator-only; using a context here causes a RuntimeError.
+    # Keep this a no-op context manager.
+    return nullcontext()
 
 
 def _force_return_dict_on_forward(m):

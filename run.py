@@ -12,7 +12,19 @@ from typing import List, Tuple, Dict, Any, Optional
 
 from packaging.version import parse as V
 import trl as trl_lib
+# 👇 place this right after "import trl as trl_lib"
+import trl.trainer.utils as _trl_utils
 
+if not getattr(_trl_utils, "_safe_generate_patched", False):
+    _orig_generate = _trl_utils.generate
+
+    def _safe_generate(*args, **kwargs):
+        with no_dynamo():                 # hard-stop any Dynamo compile of the gen path
+            return _orig_generate(*args, **kwargs)
+
+    _trl_utils.generate = _safe_generate
+    _trl_utils._safe_generate_patched = True
+    print("[PATCH] TRL utils.generate wrapped with no_dynamo()")
 import numpy as np
 import torch
 import torch.nn as nn
@@ -40,7 +52,12 @@ from contextlib import contextmanager
 from contextlib import nullcontext
 
 def no_dynamo():
-    return nullcontext()
+    try:
+        import torch._dynamo as dynamo
+        return dynamo.disable()   # real context manager in PyTorch 2.x
+    except Exception:
+        return nullcontext()
+
 
 def _force_return_dict_on_forward(m):
     if m is None:

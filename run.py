@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 import os
-os.environ["TORCH_COMPILE_DISABLE"] = "1"
-os.environ["TORCHDYNAMO_DISABLE"] = "1"
-os.environ["ACCELERATE_USE_DYNAMO"] = "0"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("GLOG_minloglevel", "3")
+os.environ.setdefault("JAX_PLATFORMS", "cpu")   # we're not using JAX here
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 import os, re, json, time, signal, warnings, random, subprocess, sys, inspect, math
 from dataclasses import dataclass, asdict
 from typing import List, Tuple, Dict, Any, Optional
@@ -59,6 +59,35 @@ def _force_return_dict_on_forward(m):
         kwargs.setdefault("return_dict", True)
         return orig_forward(*args, **kwargs)
     base.forward = _fwd
+
+def _force_logit_object_forward(m):
+    """
+    Make sure forward(..., return_dict=True) and coerce tuple outputs to an
+    object with .logits, so TRL's PPOTrainer doesn't crash.
+    """
+    if m is None or not hasattr(m, "forward"):
+        return
+    raw_fwd = m.forward
+
+    def fwd(*a, **k):
+        k.setdefault("return_dict", True)
+        out = raw_fwd(*a, **k)
+        if isinstance(out, tuple):
+            # assume first element are the logits (HF default when return_dict=False)
+            class _O: pass
+            o = _O()
+            o.logits = out[0]
+            return o
+        return out
+
+    try:
+        # also set the config flag if present
+        if hasattr(m, "config"):
+            m.config.return_dict = True
+    except Exception:
+        pass
+
+    m.forward = fwd
 
 # --- TRL 0.21+ wrappers: ensure .generate and writable configs on PolicyAndValueWrapper ---
 try:
@@ -1507,7 +1536,18 @@ def ppo_train(args: Args, sft_dataset: Dataset, pc: PrecisionCfg):
         reward_model=rm
     )
 
-    _force_return_dict_on_forward(getattr(trainer, "model", None))
+    # --- make sure the *actual* reference model used by PPOTrainer returns dicts ---
+    _force_return_dict_on_forward(getattr(trainer, "model", None))  # you already had this
+
+    # Patch all plausible ref-model anchors the trainer might use
+    for cand in (
+        getattr(trainer, "ref_model", None),
+        getattr(trainer, "reference_model", None),
+        getattr(getattr(trainer, "model", None), "ref_model", None),
+        getattr(getattr(trainer, "model", None), "reference_model", None),
+    ):
+        _force_return_dict_on_forward(cand)   # your existing helper
+        _force_logit_object_forward(cand)     # NEW: tuple -> object with .logits
 
     m = getattr(trainer, "model", None)
     if m is not None and not hasattr(m, "generate"):

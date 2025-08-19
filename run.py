@@ -2,10 +2,14 @@
 # -*- coding: utf-8 -*-
 import os
 
+# Quiet noisy backends and ensure no TorchDynamo compilation (avoids inlining
+# errors with Unsloth/TRL patched forwards during generate/ppo).
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("GLOG_minloglevel", "3")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")   # we're not using JAX here
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
 import os, re, json, time, signal, warnings, random, subprocess, sys, inspect, math
 from dataclasses import dataclass, asdict
 from typing import List, Tuple, Dict, Any, Optional

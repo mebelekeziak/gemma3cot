@@ -72,7 +72,8 @@ def _force_return_dict_on_forward(m):
         pass
     orig_forward = base.forward
     def _fwd(*args, **kwargs):
-        kwargs.setdefault("return_dict", True)
+        # Force return_dict=True even if caller passes False
+        kwargs["return_dict"] = True
         return orig_forward(*args, **kwargs)
     base.forward = _fwd
 

@@ -42,6 +42,24 @@ from contextlib import nullcontext
 def no_dynamo():
     return nullcontext()
 
+def _force_return_dict_on_forward(m):
+    if m is None:
+        return
+    base = (getattr(m, "pretrained_model", None)
+            or getattr(m, "policy_model", None)
+            or getattr(m, "actor_model", None)
+            or getattr(m, "model", None)
+            or m)
+    try:
+        base.config.return_dict = True
+    except Exception:
+        pass
+    orig_forward = base.forward
+    def _fwd(*args, **kwargs):
+        kwargs.setdefault("return_dict", True)
+        return orig_forward(*args, **kwargs)
+    base.forward = _fwd
+
 # --- TRL 0.21+ wrappers: ensure .generate and writable configs on PolicyAndValueWrapper ---
 try:
     try:
@@ -1340,6 +1358,13 @@ def build_ppo_policy_with_lora(args: Args, pc: PrecisionCfg) -> Tuple[AutoModelF
     except Exception:
         pass
 
+    try:
+        policy.config.return_dict = True
+        if hasattr(policy, "pretrained_model"):
+            policy.pretrained_model.config.return_dict = True
+    except Exception:
+        pass
+
     return policy, tok
 
 def _fully_disable_gc(model) -> None:
@@ -1435,7 +1460,8 @@ def ppo_train(args: Args, sft_dataset: Dataset, pc: PrecisionCfg):
                 ref_model.pretrained_model.forward = dynamo.disable(ref_model.pretrained_model.forward)
         except Exception:
             pass
-
+    _force_return_dict_on_forward(policy)
+    _force_return_dict_on_forward(ref_model)
     ensure_generation_config(policy, tok)
 
     # ---- Reward wiring ----
@@ -1480,6 +1506,8 @@ def ppo_train(args: Args, sft_dataset: Dataset, pc: PrecisionCfg):
         data_collator=ppo_collator,
         reward_model=rm
     )
+
+    _force_return_dict_on_forward(getattr(trainer, "model", None))
 
     m = getattr(trainer, "model", None)
     if m is not None and not hasattr(m, "generate"):

@@ -1388,16 +1388,6 @@ def build_ppo_policy_with_lora(args: Args, pc: PrecisionCfg) -> Tuple[AutoModelF
     # Disable grad checkpointing everywhere
     _fully_disable_gc(policy)
 
-    try:
-        import torch._dynamo as dynamo
-        if hasattr(policy, "forward"):
-            policy.forward = dynamo.disable(policy.forward)
-        if hasattr(policy, "generate"):
-            policy.generate = dynamo.disable(policy.generate)
-        if hasattr(policy, "pretrained_model") and hasattr(policy.pretrained_model, "forward"):
-            policy.pretrained_model.forward = dynamo.disable(policy.pretrained_model.forward)
-    except Exception:
-        pass
 
     try:
         policy.config.return_dict = True
@@ -1491,16 +1481,7 @@ def ppo_train(args: Args, sft_dataset: Dataset, pc: PrecisionCfg):
         _fix_trl_valuehead_base_prefix(ref_model)
         _fully_disable_gc(ref_model)
         upcast_linear_inputs_to_weight_dtype(getattr(ref_model, "pretrained_model", ref_model))
-        try:
-            import torch._dynamo as dynamo
-            if hasattr(ref_model, "forward"):
-                ref_model.forward = dynamo.disable(ref_model.forward)
-            if hasattr(ref_model, "generate"):
-                ref_model.generate = dynamo.disable(ref_model.generate)
-            if hasattr(ref_model, "pretrained_model") and hasattr(ref_model.pretrained_model, "forward"):
-                ref_model.pretrained_model.forward = dynamo.disable(ref_model.pretrained_model.forward)
-        except Exception:
-            pass
+
     _force_return_dict_on_forward(policy)
     _force_return_dict_on_forward(ref_model)
     ensure_generation_config(policy, tok)

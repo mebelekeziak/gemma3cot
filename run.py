@@ -1537,14 +1537,14 @@ def ppo_train(args: Args, sft_dataset: Dataset, pc: PrecisionCfg):
     _force_return_dict_on_forward(getattr(trainer, "model", None))  # you already had this
 
     # Patch all plausible ref-model anchors the trainer might use
+    # Only enforce return_dict=True to avoid TRL hooks expecting iterable outputs
     for cand in (
         getattr(trainer, "ref_model", None),
         getattr(trainer, "reference_model", None),
         getattr(getattr(trainer, "model", None), "ref_model", None),
         getattr(getattr(trainer, "model", None), "reference_model", None),
     ):
-        _force_return_dict_on_forward(cand)   # your existing helper
-        _force_logit_object_forward(cand)     # NEW: tuple -> object with .logits
+        _force_return_dict_on_forward(cand)
 
     m = getattr(trainer, "model", None)
     if m is not None and not hasattr(m, "generate"):
